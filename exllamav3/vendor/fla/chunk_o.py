@@ -14,9 +14,30 @@ from .op import exp2
 from .utils import IS_NVIDIA_HOPPER
 from .utils import autotune_cache_kwargs
 from .utils import check_shared_mem
+from .utils import get_all_max_shared_mem
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+
+# sm_75 (Turing, 64 KB smem): the 128x128 3-stage config needs ~96 KB and dies at launch on the
+# smallest device; autotune does not catch OutOfResources, so too-big configs must be excluded.
+# Process-wide tiering on the minimum device, matching fla's check_shared_mem doctrine.
+_SMEM_MIN = min(get_all_max_shared_mem())
+if _SMEM_MIN >= 102400:
+    _FWD_O_CONFIGS = [
+        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+    ]
+elif _SMEM_MIN >= 65536:
+    _FWD_O_CONFIGS = [
+        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+    ]
+else:
+    _FWD_O_CONFIGS = [
+        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+    ]
 
 
 @triton.heuristics({
@@ -25,11 +46,7 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ],
+    configs=_FWD_O_CONFIGS,
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
