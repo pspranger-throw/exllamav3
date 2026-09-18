@@ -108,6 +108,7 @@ gemm_kernel
     long long strideA, long long strideB, long long strideC
 )
 {
+#if __CUDA_ARCH__ >= 800   // sm75: kernels compiled empty; hgemm_f16acc_enabled() already declines major < 8
     using CF = Config<TILE_N, TUNED>;
     constexpr int BM = CF::BM, BN = CF::BN, BK = CF::BK, THREADS = CF::THREADS;
     constexpr int STAGES = CF::STAGES, GROUP_M = CF::GROUP_M;
@@ -306,12 +307,14 @@ gemm_kernel
                 }
             }
         }
+#endif
 }
 
 // Rate probe: independent register-resident MMA chains, no memory traffic
 template <bool F16>
 __global__ void __launch_bounds__(256) rate_kernel(int iters, float* sink)
 {
+#if __CUDA_ARCH__ >= 800
     uint32_t a0 = threadIdx.x, a1 = a0 + 1, a2 = a0 + 2, a3 = a0 + 3, b0 = a0 + 5, b1 = a0 + 7;
     uint32_t a[4] = { a0, a1, a2, a3 }, b[2] = { b0, b1 };
     uint32_t h[8][2] = {};
@@ -329,6 +332,7 @@ __global__ void __launch_bounds__(256) rate_kernel(int iters, float* sink)
     #pragma unroll
     for (int c = 0; c < 8; ++c) s += F16 ? __uint_as_float(h[c][0] ^ h[c][1]) : f[c][0] + f[c][3];
     if (s == 123.456f) sink[threadIdx.x] = s;
+#endif
 }
 
 // Per-device decision: -1 unknown, 0 off, 1 on
