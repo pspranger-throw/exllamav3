@@ -102,11 +102,12 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
     (void) frag_stages;
     int tileblocks_k = tilesize_k / 16;
     int tileblocks_n = tilesize_n / 16;
+    int tileblocks_m = tilesize_m / 16;
     int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
 
     int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
     int sh_b_stage_size = tileblocks_k * tileblocks_n * 256 / 16 * bits;       // uint16s
-    int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp;             // floats
+    int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m;  // floats (v1.5.0: reduction scratch scales with TILEBLOCKS_M)
     int sh_c_had = shmem_out_had ? tilesize_n * tilesize_m : 0;
     if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
 
