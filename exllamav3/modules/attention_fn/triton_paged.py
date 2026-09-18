@@ -58,11 +58,9 @@ def _oom_is_smem(e: BaseException) -> bool:
 
     The tile configs are pre-shrunk for small-smem devices, but that reasoning is per-kernel
     and cannot cover every geometry a caller might present. Treating this one error as a
-    dispatch miss lets the attention dispatcher fall through to the next backend (SDPA,
+    re-dispatch lets the attention dispatcher fall through to the next backend (SDPA,
     xformers) instead of aborting the forward pass. Any other error still propagates.
     """
-    if not has_triton:
-        return False
     from triton.runtime.errors import OutOfResources
     return isinstance(e, OutOfResources) and "shared memory" in str(e)
 
