@@ -327,6 +327,32 @@ def _restore_serial_state(generator, snapshot):
             p.access_serial = page_serials[p.phash]
 
 
+def _burn_pool_fragmentation(generator, tokenizer, n_pages):
+    """Deterministic hole-punch so PageTable.defrag() actually rotates — its no-op gate skips any layout
+    where <= max(max_pages // 10, 2) pages would change index (pagetable.py:969-970), and a linear chain
+    in a fresh 800-page pool moves ZERO pages, so test v's race would never be exercised.
+
+    Mechanism: occupy `n_pages` physical pages at the FRONT of the pool with a throwaway prefill, then
+    clear() every complete page it left behind (identity destroyed, kv_position = 0, pagetable.py:173-184)
+    and wipe its recurrent stashes. The live conversation then allocates mid-pool instead of at slot 0:
+    empty-class eviction is oldest-access_serial first (pagetable build_eviction_order class 1), and the
+    cleared pages carry the HIGHEST serials (they were stamped at 801+ during the burn), so never-used
+    mid-pool slots win. Compaction then moves >= n_pages + chain pages (front holes + the displaced
+    chain) — with n_pages = 100 and a ~25-page chain that is ~125 >= 81 moves — and `_force_defrag`'s
+    before/after fingerprint proves the relocation was real.
+    """
+    pt = generator.pagetable
+    block = _encode_ids(tokenizer, _BLOCK_LINE.format(i = 0))[0]
+    need = n_pages * PAGE_SIZE + 1                 # (len-1) // PAGE_SIZE == n_pages full prompt pages
+    ids = block.repeat((need + len(block) - 1) // len(block))[:need].unsqueeze(0)
+    _run_turn(generator, ids, max_new_tokens=8, min_new_tokens=4)
+    for p in list(pt.unreferenced_pages.values()):
+        if p.kv_position == PAGE_SIZE:
+            p.clear()
+    if generator.recurrent_cache is not None:
+        generator.recurrent_cache.clear()
+
+
 @contextlib.contextmanager
 def _save_copy_stage_race(generator):
     """Exercise the Q1 defrag-race seam (BLOCKER C): force a defrag to race the snapshot capture at the
@@ -389,6 +415,12 @@ def conversation(tmp_path_factory):
         pytest.skip(reason)
 
     gen, tok = _build_gen(cache_size = CACHE_SIZE_204K, gpu_split = GPU_SPLIT)
+
+    # Hole-punch the pool BEFORE the conversation so the chain lands mid-pool and the test-v defrag race
+    # is real (see _burn_pool_fragmentation). The burn's throwaway pages/stashes are fully cleared, so
+    # every store below stays a clean single-chain capture of the conversation only.
+    _burn_pool_fragmentation(gen, tok, n_pages = 100)
+
     turn_texts = _build_turn_texts()
     outputs = []
     for i in range(len(turn_texts)):
