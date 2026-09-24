@@ -15,6 +15,7 @@ These run without CUDA; the model-bearing acceptance remains the P1 suite
 import asyncio
 import sys
 import os
+import types
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -69,9 +70,9 @@ class ExplicitDelegateTests(unittest.TestCase):
 
     def test_delegates_reach_the_inner_generator(self):
         stub = StubSyncGenerator()
-        ag = make_async_gen(stub)
 
         async def run():
+            ag = make_async_gen(stub)
             out = await ag.request_save("/tmp/x", stash_budget_mb = 64)
             await ag.close()
             return out
@@ -80,9 +81,13 @@ class ExplicitDelegateTests(unittest.TestCase):
         self.assertEqual(result, stub._save_result)
         self.assertEqual(stub.save_calls, [("/tmp/x", 64)])
 
-        stub2 = StubSyncGenerator()
-        ag2 = make_async_gen(stub2)
-        self.assertEqual(ag2.restore_state("/tmp/y"), {"restored_from": "/tmp/y"})
+        async def run_restore():
+            ag2 = make_async_gen(StubSyncGenerator())
+            got = ag2.restore_state("/tmp/y")
+            await ag2.close()
+            return got
+
+        self.assertEqual(asyncio.run(run_restore()), {"restored_from": "/tmp/y"})
 
 
 class SavePassQ1Tests(unittest.TestCase):
@@ -90,9 +95,9 @@ class SavePassQ1Tests(unittest.TestCase):
         """request_save must resolve via the loop's save pass, and the save must not interleave
         with iterate(): no iterate() call may happen inside the save window (Q1)."""
         stub = StubSyncGenerator(save_result = {"ok": True})
-        ag = make_async_gen(stub)
 
         async def run():
+            ag = make_async_gen(stub)
             fut = ag.request_save("/tmp/s")
             # Nothing may run until the iteration task gets scheduled
             self.assertEqual(stub.save_calls, [])
@@ -124,27 +129,29 @@ class SavePassQ1Tests(unittest.TestCase):
                 pass
 
         stub = OrderStub()
-        ag = make_async_gen(stub)
 
         async def run():
+            ag = make_async_gen(stub)
             fut = ag.request_save("/tmp/s")
             await fut
             # A job arriving after the save must land on a later loop pass
-            fake = object()
-            ag.jobs[fake] = None
+            fake_job = object()
+            fake_async_job = types.SimpleNamespace(put_result = lambda result: None)
+            ag.jobs[fake_job] = fake_async_job
             await ag._notify_condition()
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             await ag.close()
 
         asyncio.run(run())
-        self.assertEqual(order, ["save", "iterate"])
+        self.assertEqual(order[:2], ["save", "iterate"],
+                         "the save pass must consume its pass whole: iterate() runs on a LATER pass")
 
     def test_double_pending_save_is_rejected(self):
         stub = StubSyncGenerator()
-        ag = make_async_gen(stub)
 
         async def run():
+            ag = make_async_gen(stub)
             fut = ag.request_save("/tmp/s1")
             with self.assertRaises(RuntimeError):
                 ag.request_save("/tmp/s2")
@@ -155,9 +162,9 @@ class SavePassQ1Tests(unittest.TestCase):
 
     def test_save_exception_fails_the_future(self):
         stub = StubSyncGenerator(save_error = RuntimeError("boom"))
-        ag = make_async_gen(stub)
 
         async def run():
+            ag = make_async_gen(stub)
             fut = ag.request_save("/tmp/s")
             with self.assertRaises(RuntimeError):
                 await fut
@@ -167,11 +174,15 @@ class SavePassQ1Tests(unittest.TestCase):
 
     def test_latched_error_rejects_save(self):
         stub = StubSyncGenerator()
-        ag = make_async_gen(stub)
-        ag.error = RuntimeError("latched")
-        with self.assertRaises(RuntimeError):
-            ag.request_save("/tmp/s")
-        asyncio.run(ag.close())
+
+        async def run():
+            ag = make_async_gen(stub)
+            ag.error = RuntimeError("latched")
+            with self.assertRaises(RuntimeError):
+                ag.request_save("/tmp/s")
+            await ag.close()
+
+        asyncio.run(run())
 
 
 class ZeroStashSkipPolicyTests(unittest.TestCase):
