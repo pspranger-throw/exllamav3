@@ -209,7 +209,11 @@ def stash_blob(state: dict):
     """Serialise one stashed recurrent state: every (layer_idx, instance) keyed entry, in dict order,
     as raw bytes plus a positional descriptor [key, nbytes, shape, dtype, kind]. `kind` is per key
     (GDN stashes a (recurrent_state, conv_state) PAIR under one key; other module types stash a bare
-    TENSOR), and must be remembered per key on restore — not taken from the last descriptor."""
+    TENSOR), and must be remembered per key on restore — not taken from the last descriptor.
+
+    Limitation (v1): only (layer_idx, instance) tuple keys are serialised. Non-tuple state fields
+    beyond `position`/`checkpoint_size` (SWA/DSA `window_beg`, TP `tp_handle`) are dropped, so this
+    is GDN-pair-faithful and explicitly not a general recurrent-state format."""
     tbuf = bytearray()
     tdesc = []
     for key in [kk for kk in state.keys() if isinstance(kk, tuple)]:
@@ -273,14 +277,33 @@ def validate_store_dir(store_dir: str, files: dict):
             raise RuntimeError(f"digest/size validation failed for {fn}")
 
 
+def prepare_stage(parent: str, final_dir: str) -> str:
+    """Create the sibling staging dir for `final_dir`, clean of any residue an earlier crashed save
+    under this process name left there. The clean is load-bearing: `digest_dir` hashes every file
+    present at staging time, so a stale leftover — even a stale meta.json from a save that died
+    between meta-write and publish — would be digested into the new set's `meta["files"]`, and the
+    fresh meta.json would then fail its own recorded digest at every later restore."""
+    stage = os.path.join(parent, f".tmp-{os.path.basename(final_dir)}-{os.getpid()}")
+    shutil.rmtree(stage, ignore_errors = True)
+    os.makedirs(stage)
+    return stage
+
+
 def stage_atomic_rename(stage_dir: str, final_dir: str):
     """G6 atomicity: publish the staged dir with a rename, keeping any previous set intact until the
-    new one has landed, and only then dropping the old one."""
+    new one has landed, and only then dropping the old one. If the publish rename fails after a
+    previous set was moved aside, that set is moved back — the store path is never left empty while
+    an intact `.old-<pid>` sibling hides the data."""
     old = None
     if os.path.exists(final_dir):
         old = final_dir + ".old-" + str(os.getpid())
         os.rename(final_dir, old)
-    os.rename(stage_dir, final_dir)
+    try:
+        os.rename(stage_dir, final_dir)
+    except Exception:
+        if old is not None:
+            os.rename(old, final_dir)
+        raise
     if old is not None:
         shutil.rmtree(old, ignore_errors = True)
 
