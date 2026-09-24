@@ -48,6 +48,7 @@ import contextlib
 import gc
 import json
 import os
+import shutil
 import sys
 import types
 
