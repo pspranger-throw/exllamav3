@@ -47,6 +47,7 @@ What the tests are and are not about — read before editing:
 import contextlib
 import json
 import os
+import shutil
 import sys
 import types
 
@@ -374,11 +375,15 @@ def _skip_if_unavailable():
 
 
 @pytest.fixture(scope = "session")
-def conversation():
-    """Session source generator: build in the prod dual shape, drive a two-turn conversation (so GDN stashes
-    accumulate during decode and the second turn extends the prefix past the deepest anchor — the normal
-    clamp-tail case), then hand back everything a test needs to restore and verify. Built once; torn down
-    after the session."""
+def conversation(tmp_path_factory):
+    """Single-model source for the whole session: build in the prod dual shape, drive a two-turn conversation
+    (so GDN stashes accumulate during decode and the second turn extends the prefix past the deepest anchor —
+    the normal clamp-tail case), then build BOTH on-disk stores any test needs WHILE the source is still
+    alive, unload the source, and hand back everything CPU-side. This is deliberately model-lifetime
+    serialisation, not a contract change: the prod dual shape fills ~30 GiB of the 32 GiB across the two
+    cards, so a second full 205B generator can never load — every test therefore works from a pre-built
+    store copy and builds at most one fresh generator of its own. Built once; the source is unloaded before
+    the first test body runs (sanity property: at most one _build_gen-built generator is ever alive)."""
     reason = _skip_if_unavailable()
     if reason is not None:
         pytest.skip(reason)
@@ -410,16 +415,47 @@ def conversation():
         original_output = outputs[-1],
         context_pages = (int(restore_prompt_tokens.shape[-1]) - 1) // PAGE_SIZE,
     )
-    yield info
+
+    # Build both stores while the source is alive, THEN unload it. From here on the source no longer exists
+    # in any test body — every test operates from a copy of one of these two dirs.
+
+    # BASE store: a plain save on the quiescent source; the verified copy every non-raced test uses.
+    base_dir = tmp_path_factory.mktemp("kvsave_base") / STORE_NAME
+    gen.save_state(str(base_dir))
+    info.base_store = base_dir
+
+    # RACED store: the exact save / defrag-race / serial-hygiene sequence test v performs, moved to fixture
+    # time so the defrag truly races the copy mid-capture. The race IS still exercised (that is test v's
+    # point); _force_defrag raises loudly if the cache was too unfragmented to rotate, failing the session
+    # rather than false-passing.
+    raced_dir = tmp_path_factory.mktemp("kvsave_raced") / STORE_NAME
+    serial_snapshot = _snapshot_serial_state(gen)
+    with _save_copy_stage_race(gen):
+        gen.save_state(str(raced_dir))
+    _restore_serial_state(gen, serial_snapshot)
+    info.raced_store = raced_dir
+
     _unload(gen)
+    info.gen = None          # source gone before the first test body — sanity property (spec §6)
+    yield info
+    if info.gen is not None:  # no-op in practice: the source is unloaded above the yield
+        _unload(info.gen)
+
+
+def _copy_store(src, dst):
+    """Copy an on-disk store dir to dst (shutil.copytree, idempotent if dst pre-exists). The BASE and RACED
+    stores are each built once at session start from the single source generator; a test copies the one it
+    needs into a fresh tmp_path so the body can tamper with (or restore from) the set without touching the
+    session-level directory."""
+    shutil.copytree(str(src), str(dst), dirs_exist_ok = True)
 
 
 @pytest.fixture
 def source_store(conversation, tmp_path):
-    """A fresh, valid save on the quiescent source generator, one temp dir per test (atomic write in)."""
+    """A verified copy of the session BASE save (plain save on the quiescent source), one fresh temp dir per
+    test (so the body can restore from it)."""
     _skip_if_unavailable()  # no-op if the session fixture already skipped
-    store = tmp_path / STORE_NAME
-    conversation.gen.save_state(str(store))
+    store = _copy_store(conversation.base_store, tmp_path / STORE_NAME)
     yield store
 
 
@@ -491,8 +527,7 @@ def test_ii_torn_set_rejection(conversation, tmp_path):
     """(ii) torn-set rejection: delete meta.json mid-round-trip (Layer-A integrity) -> restore must fail-closed
     to a clean cold start with NO partial state, and the (now-broken) set is kept for forensics."""
     info = conversation
-    store = tmp_path / STORE_NAME
-    info.gen.save_state(str(store))
+    store = _copy_store(info.base_store, tmp_path / STORE_NAME)
 
     meta_path = os.path.join(str(store), "meta.json")
     assert os.path.exists(meta_path)
@@ -526,8 +561,7 @@ def test_iii_config_mismatch_rejection(conversation, tmp_path):
     """(iii) config-mismatch rejection: a 204k store must not restore into a 130k pool -> cold start, loud
     failure path, set kept. cache_size / cache_mode / tensor-manifest are the mismatch keys."""
     info = conversation
-    store = tmp_path / STORE_NAME
-    info.gen.save_state(str(store))
+    store = _copy_store(info.base_store, tmp_path / STORE_NAME)
 
     meta = _read_json(store, "meta.json")
     store_pool = meta["pins"]["cache_size"]
@@ -612,16 +646,11 @@ def test_v_defrag_race_q1(conversation, tmp_path):
     non-exercised race fails loud instead of false-passing. The shared source generator's serial state is
     snapshotted before and restored after the save, so the race does not leak into a later save (NOTE 1)."""
     info = conversation
-    store = tmp_path / STORE_NAME
-
-    # Fresh save from the source, racing a defrag at the enumerate→copy boundary. (BLOCKER C: the
-    # source_store fixture completes save_state before the body runs, so a post-fixture _force_defrag would
-    # mutate a snapshot already on disk — this instead races the capture itself.) The serial state is captured
-    # first and restored after so the defrag does not cross-test-couple a later save (NOTE 1).
-    serial_snapshot = _snapshot_serial_state(info.gen)
-    with _save_copy_stage_race(info.gen):
-        info.gen.save_state(str(store))
-    _restore_serial_state(info.gen, serial_snapshot)
+    # The RACED store (defrag racing the enumerate→copy boundary) was built once at session start from the
+    # single source generator; copy it into a fresh tmp_path so the body can restore from it. The race was
+    # genuinely exercised at fixture time — _force_defrag really repaginated mid-capture and the fresh-index
+    # copy is what this test gates — so no live generator or save call is needed here.
+    store = _copy_store(info.raced_store, tmp_path / STORE_NAME)
 
     with _target_gen(CACHE_SIZE_204K) as tgt:
         with torch.inference_mode():
@@ -666,8 +695,7 @@ def test_vi_chain_completeness(conversation, tmp_path):
     so every kept entry's absolute offset still reads its correct bytes; only this one page is absent, orphaning
     its child)."""
     info = conversation
-    store = tmp_path / STORE_NAME
-    info.gen.save_state(str(store))
+    store = _copy_store(info.base_store, tmp_path / STORE_NAME)
 
     # Ground truth for the unbroken chain: chain.json entries root -> leaf (probe save layout).
     chain = _read_json(store, "chain.json")
