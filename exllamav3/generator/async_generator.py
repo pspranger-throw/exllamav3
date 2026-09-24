@@ -17,16 +17,77 @@ class AsyncGenerator:
         self.jobs = {}
         self.error = None
         self.condition = asyncio.Condition()
+        self._save_request = None
         self.iteration_task = asyncio.create_task(self._run_iteration())
+
+    def save_state(self, store: str, stash_budget_mb: int | None = None) -> dict:
+        """
+        Explicit delegate to `Generator.save_state` — a synchronous save executed on the CALLER's
+        thread of control. Exposed as a real method (never `__getattr__` forwarding) so the save
+        surface is discoverable and typed.
+
+        Production saves should use `request_save()` instead: that queues the snapshot to run inside
+        the iteration task, strictly serialized with `iterate()` (the Q1 invariant — see
+        Generator.save_state for why a mid-iteration snapshot is not a snapshot of anything).
+        """
+        return self.generator.save_state(store, stash_budget_mb = stash_budget_mb)
+
+    def restore_state(self, store: str) -> dict:
+        """
+        Explicit delegate to `Generator.restore_state` (eager restore, fail-closed to caller).
+        Synchronous; call it on a fresh generator before any job is enqueued (tabbyAPI's
+        create_generator path).
+        """
+        return self.generator.restore_state(store)
+
+    def request_save(self, store: str, stash_budget_mb: int | None = None) -> asyncio.Future:
+        """
+        Queue a save for the iteration task and return a future for its result dict.
+
+        The snapshot runs as one synchronous unit in `_run_iteration`, strictly alternating with
+        `iterate()` — save and generation can never interleave, which is what makes the capture
+        defrag/eviction-safe (Q1). The future resolves with `Generator.save_state`'s return dict
+        (including the zero-stash skip shape) or fails with its exception. A second request while
+        one is pending is a caller error (the endpoint serializes saves under the load lock).
+        """
+        if self.error is not None:
+            raise RuntimeError(f"generator is latched failed: {self.error!r}")
+        if self._save_request is not None:
+            raise RuntimeError("a save request is already pending")
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._save_request = (store, stash_budget_mb, fut)
+        # Condition.notify_all() must run while holding the condition lock; wake the loop the same
+        # way enqueue() does.
+        asyncio.create_task(self._notify_condition())
+        return fut
 
     async def _run_iteration(self):
         try:
             while True:
                 # Sleep while there is no async work registered. The condition releases its lock while waiting and
-                # is notified by enqueue() or close(), so this background task does not spin between requests.
+                # is notified by enqueue(), request_save() or close(), so this background task does not spin between
+                # requests.
                 async with self.condition:
-                    # Wake when the first job arrives or when close() has cancelled the iteration task.
-                    await self.condition.wait_for(lambda: len(self.jobs) > 0 or self.iteration_task.cancelled())
+                    # Wake when the first job arrives, a save is requested, or when close() has cancelled the
+                    # iteration task.
+                    await self.condition.wait_for(lambda: len(self.jobs) > 0 or self._save_request is not None
+                                                  or self.iteration_task.cancelled())
+
+                # A save request consumes this whole pass: the snapshot is one synchronous unit run strictly
+                # before or after any iterate(), never between one and the next (Q1). Jobs enqueued meanwhile
+                # wait for the next pass.
+                if self._save_request is not None:
+                    store, stash_budget_mb, fut = self._save_request
+                    self._save_request = None
+                    if not fut.cancelled():
+                        try:
+                            result = self.save_state(store, stash_budget_mb = stash_budget_mb)
+                        except Exception as e:
+                            fut.set_exception(e)
+                        else:
+                            fut.set_result(result)
+                    continue
 
                 # Drive exactly one synchronous generator step and fan out any returned events to the owning
                 # AsyncJob queues. Missing jobs can happen if a job was cancelled after iterate() started.
@@ -41,7 +102,12 @@ class AsyncGenerator:
                 await asyncio.sleep(0)
 
         except asyncio.CancelledError:
-            # Silently return on cancel
+            # A pending save will never run now; fail its future instead of leaving the caller to time out.
+            if self._save_request is not None:
+                _, _, fut = self._save_request
+                self._save_request = None
+                if not fut.cancelled() and not fut.done():
+                    fut.set_exception(asyncio.CancelledError("iteration task closed before the save ran"))
             return
 
         except Exception as e:
@@ -52,6 +118,11 @@ class AsyncGenerator:
             for async_job in self.jobs.values():
                 async_job.put_result(e)
             self.jobs.clear()
+            if self._save_request is not None:
+                _, _, fut = self._save_request
+                self._save_request = None
+                if not fut.cancelled() and not fut.done():
+                    fut.set_exception(e)
 
     def deliver_results(self, results):
         """
