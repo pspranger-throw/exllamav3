@@ -1928,8 +1928,10 @@ class Generator:
         Fail-closed and atomic. EVERY check — file digests/sizes, pins, the capture-time chain gates,
         the stash/presence gate — runs before a single page or stash is touched, and the store
         directory is never modified, so a rejected store is kept intact for forensics and the caller
-        (tabbyAPI's create_generator path in P2) catches the exception and continues COLD. There is no
-        code path from a failed validation to a mutated pool: the engine never half-restores.
+        (tabbyAPI's create_generator path in P2) catches the exception and continues COLD. No VALIDATION
+        failure mutates the pool: every check — including per-entry prev_hash/tokens payloads — runs in
+        the pre-mutation pass before the first write. A non-validation failure (I/O, a torch/CUDA error
+        mid-copy) is reported to the caller as-is, with the pool in whatever partial state it reached.
 
         The pool starts empty — a fresh PageTable keys every page by a random placeholder hash
         (pagetable.py:350-380) — so restoring is idempotent by construction: a recreated generator
@@ -1972,6 +1974,8 @@ class Generator:
         for sm in meta["stashes"]:
             if os.path.basename(sm["file"]) != sm["file"]:
                 raise RuntimeError(f"stash file name escapes the store dir: {sm['file']!r}")
+            if sm["file"] not in meta["files"]:
+                raise RuntimeError(f"stash file {sm['file']!r} has no recorded digest")
 
         cache = self.cache
         pins = meta["pins"]
@@ -2038,6 +2042,17 @@ class Generator:
             if phash in seen or phash in pt.unreferenced_pages or phash in pt.referenced_pages:
                 raise RuntimeError("restored content hash collides with a page already in the pool")
             seen.add(phash)
+            if e["prev_hash"] is not None:
+                try:
+                    prev = bytes.fromhex(e["prev_hash"])
+                except (TypeError, ValueError):
+                    raise RuntimeError("chain entry prev_hash is not valid hex")
+                if len(prev) != 16:
+                    raise RuntimeError("chain entry prev_hash is not a 16-byte hash")
+            tokens = e["tokens"]
+            if not isinstance(tokens, list) or len(tokens) != PAGE_SIZE or \
+                    not all(isinstance(t, int) and not isinstance(t, bool) for t in tokens):
+                raise RuntimeError(f"chain entry tokens must be a list of {PAGE_SIZE} ints")
             descs = e["tensors"]
             if len(descs) != len(tensors):
                 raise RuntimeError("chain entry tensor descriptor count does not match the live "
