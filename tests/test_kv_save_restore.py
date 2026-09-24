@@ -45,9 +45,9 @@ What the tests are and are not about — read before editing:
       this contract.
 """
 import contextlib
+import gc
 import json
 import os
-import shutil
 import sys
 import types
 
@@ -197,11 +197,15 @@ def _build_gen(model_dir=MODEL_DIR, cache_size=CACHE_SIZE_204K, gpu_split=GPU_SP
 
 
 def _unload(generator):
-    """Free VRAM: cache tensors are only cleared by Model.unload() (cache.py:134) — del+empty_cache leaves GBs
-    held (findings §5)."""
+    """Free VRAM: cache tensors are only cleared by Model.unload() (cache.py:134) — del+empty_cache
+    leaves GBs held (findings §5). Caller contract: after this returns, DROP EVERY BINDING to the
+    generator and gc.collect() — the module graph is cyclic, so weights stay resident until the cycle
+    is collected even though unload() nulled every module tensor (empirical 2026-09-24: one lingering
+    `gen` binding kept 22.9 GiB alive through the entire session)."""
     torch.cuda.synchronize()
     generator.model.unload()
     del generator
+    gc.collect()
     torch.cuda.empty_cache()
 
 
@@ -448,7 +452,6 @@ def conversation(tmp_path_factory):
         restore_prompt_tokens = _encode_ids(tok, restore_prompt)[0]
 
         info = types.SimpleNamespace(
-            gen = gen,
             tokenizer = tok,
             turn_texts = turn_texts,
             outputs = outputs,
@@ -481,11 +484,13 @@ def conversation(tmp_path_factory):
     finally:
         # Unload even when a store-build step raises, so a session-fixture error can never leak the resident
         # model into the co-run bar (empirical: a leaked 205B made test_cache_rotate OOM on a 2 GiB tensor).
+        # `del gen` is load-bearing: this suspended session-fixture frame is the model's last binding, and
+        # the cyclic module graph only dies at gc.collect() — without both, the weights outlive unload().
         _unload(gen)
-    info.gen = None          # source gone before the first test body — sanity property (spec §6)
+        del gen
+        gc.collect()
+        torch.cuda.empty_cache()
     yield info
-    if info.gen is not None:  # no-op in practice: the source is unloaded above the yield
-        _unload(info.gen)
 
 
 def _copy_store(src, dst):
@@ -519,6 +524,9 @@ def _target_gen(cache_size=CACHE_SIZE_204K):
         yield tgt
     finally:
         _unload(tgt)
+        del tgt, _tok
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def _read_json(store, name):
