@@ -1047,7 +1047,7 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            "rq_new_tokens": self.rq_new_tokens + self.new_tokens,   # every token accepted so far counts (all prior segments + this one); the requeued segment starts after them
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
