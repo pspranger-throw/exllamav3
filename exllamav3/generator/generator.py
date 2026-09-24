@@ -1711,7 +1711,7 @@ class Generator:
         return extras
 
 
-    def save_state(self, store: str) -> dict:
+    def save_state(self, store: str, stash_budget_mb: int | None = None) -> dict:
         """
         Serialise this generator's paged KV cache and recurrent checkpoints into a store directory.
 
@@ -1719,6 +1719,16 @@ class Generator:
         built in a sibling temp dir and published with an atomic rename, so a crash mid-save never
         leaves a partial set at `store`, and a previously published set survives until the new one has
         fully landed.
+
+        `stash_budget_mb` caps how many recurrent checkpoints (deepest-first) the store keeps;
+        None = `kvstore.STASH_BUDGET_DEFAULT` (512 MiB). The budget is a SAVE-time knob only —
+        restore replays whatever the set carries.
+
+        ZERO-STASH SAVES ARE SKIPPED (user decision 2026-09-24, "no dead sets"): a capture with no
+        recurrent checkpoint can never restore anything on a hybrid model (the anchor clamp pins
+        `restore_limit` to the deepest stashed checkpoint), so writing such a set would only produce a
+        store that restore must reject. On skip, nothing is written, nothing existing is touched, and
+        the return dict carries `skipped = "zero-stash"` (loud `WARNING` here + the caller's own log).
 
         The snapshot is a quiescent, point-in-time read split into two wrappable stages:
 
@@ -1750,7 +1760,27 @@ class Generator:
         assert not self.pending_jobs and not self.active_jobs, \
             "save_state() called on a non-quiescent generator: the snapshot must be taken with no " \
             "pending and no active jobs (Q1). Saving while work is in flight is a programming error."
+        budget_bytes = None
+        if stash_budget_mb is not None:
+            budget_bytes = int(stash_budget_mb) * 1024 ** 2
+        self._stash_budget_bytes = budget_bytes
         self._save_targets = self._enumerate_store_targets()
+        if not self._save_targets["stashes"]:
+            n_pages = len(self._save_targets["targets"])
+            logger.warning(
+                "kv save skipped (zero-stash): %d page(s) captured but no recurrent checkpoint — "
+                "a pages-only store cannot restore on a hybrid model (anchor clamp); nothing written "
+                "to %s", n_pages, store)
+            return {
+                "dir": None,
+                "skipped": "zero-stash",
+                "n_pages": n_pages,
+                "n_stashes": 0,
+                "stash_keys": [],
+                "checks": None,
+                "meta": None,
+                "deepest_anchor_page_idx": -1,
+            }
         return self._copy_store_targets(store)
 
 
@@ -1803,7 +1833,8 @@ class Generator:
 
         stashes = []
         if self.recurrent_cache is not None:
-            stashes = kvstore.select_stashes(list(self.recurrent_cache.items()))
+            budget = getattr(self, "_stash_budget_bytes", None) or kvstore.STASH_BUDGET_DEFAULT
+            stashes = kvstore.select_stashes(list(self.recurrent_cache.items()), budget = budget)
         deepest_key = stashes[-1][0] if stashes else None
 
         return {
