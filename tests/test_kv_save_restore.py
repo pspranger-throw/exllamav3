@@ -337,18 +337,29 @@ def _burn_pool_fragmentation(generator, tokenizer, n_pages):
     and wipe its recurrent stashes. The live conversation then allocates mid-pool instead of at slot 0:
     empty-class eviction is oldest-access_serial first (pagetable build_eviction_order class 1), and the
     cleared pages carry the HIGHEST serials (they were stamped at 801+ during the burn), so never-used
-    mid-pool slots win. Compaction then moves >= n_pages + chain pages (front holes + the displaced
-    chain) — with n_pages = 100 and a ~25-page chain that is ~125 >= 81 moves — and `_force_defrag`'s
-    before/after fingerprint proves the relocation was real.
+    mid-pool slots win.
+
+    The serial scramble below is load-bearing. defrag() assigns new indices in access_serial order and
+    then rebases by the MODAL per-page shift (shift_adjust, pagetable.py:955-963) — so on any pool whose
+    serial order is a rotation of its slot order (the normal case: allocation stamps serials in slot
+    order), every page shares one shift mod max_pages and the rebase cancels EVERY move: defrag no-ops
+    even on a hole-punched layout (empirically confirmed 2026-09-24, two GPU-window runs). Giving the
+    cleared holes descending serials past the live counter makes each hole's shift unique, so the
+    never-used majority's shift wins the mode and the holes + chain all move — ~n_pages + chain pages
+    survive the rebase, well past the :970 gate.
     """
     pt = generator.pagetable
     block = _encode_ids(tokenizer, _BLOCK_LINE.format(i = 0))[0]
     need = n_pages * PAGE_SIZE + 1                 # (len-1) // PAGE_SIZE == n_pages full prompt pages
     ids = block.repeat((need + len(block) - 1) // len(block))[:need].unsqueeze(0)
     _run_turn(generator, ids, max_new_tokens=8, min_new_tokens=4)
+    burned = []
     for p in list(pt.unreferenced_pages.values()):
         if p.kv_position == PAGE_SIZE:
             p.clear()
+            burned.append(p)
+    for i, p in enumerate(burned):
+        p.access_serial = 10 ** 6 - i
     if generator.recurrent_cache is not None:
         generator.recurrent_cache.clear()
 
@@ -415,60 +426,62 @@ def conversation(tmp_path_factory):
         pytest.skip(reason)
 
     gen, tok = _build_gen(cache_size = CACHE_SIZE_204K, gpu_split = GPU_SPLIT)
+    try:
+        # Hole-punch the pool BEFORE the conversation so the chain lands mid-pool and the test-v defrag race
+        # is real (see _burn_pool_fragmentation). The burn's throwaway pages/stashes are fully cleared, so
+        # every store below stays a clean single-chain capture of the conversation only.
+        _burn_pool_fragmentation(gen, tok, n_pages = 100)
 
-    # Hole-punch the pool BEFORE the conversation so the chain lands mid-pool and the test-v defrag race
-    # is real (see _burn_pool_fragmentation). The burn's throwaway pages/stashes are fully cleared, so
-    # every store below stays a clean single-chain capture of the conversation only.
-    _burn_pool_fragmentation(gen, tok, n_pages = 100)
+        turn_texts = _build_turn_texts()
+        outputs = []
+        for i in range(len(turn_texts)):
+            prompt_text = _make_prompt(turn_texts, outputs)
+            ids = _encode_ids(tok, prompt_text)
+            res = _run_turn(gen, ids, max_new_tokens=256, min_new_tokens=16, stop = "User:")
+            outputs.append(res["full_completion"])
+            print("INFO kvsave.source.turn%d cached_tokens=%d new_tokens=%d"
+                  % (i, res["cached_tokens"], res["new_tokens"]), flush = True)
 
-    turn_texts = _build_turn_texts()
-    outputs = []
-    for i in range(len(turn_texts)):
-        prompt_text = _make_prompt(turn_texts, outputs)
-        ids = _encode_ids(tok, prompt_text)
-        res = _run_turn(gen, ids, max_new_tokens=256, min_new_tokens=16, stop = "User:")
-        outputs.append(res["full_completion"])
-        print("INFO kvsave.source.turn%d cached_tokens=%d new_tokens=%d"
-              % (i, res["cached_tokens"], res["new_tokens"]), flush = True)
+        # The prompt re-streamed at restore time: the full conversation up to and including the last user turn,
+        # with a next-turn scaffold. Its tokens are what restore must resume from.
+        restore_prompt = _make_prompt(turn_texts, outputs[:-1])
+        restore_prompt_tokens = _encode_ids(tok, restore_prompt)[0]
 
-    # The prompt re-streamed at restore time: the full conversation up to and including the last user turn,
-    # with a next-turn scaffold. Its tokens are what restore must resume from.
-    restore_prompt = _make_prompt(turn_texts, outputs[:-1])
-    restore_prompt_tokens = _encode_ids(tok, restore_prompt)[0]
+        info = types.SimpleNamespace(
+            gen = gen,
+            tokenizer = tok,
+            turn_texts = turn_texts,
+            outputs = outputs,
+            restore_prompt = restore_prompt,
+            restore_prompt_tokens = restore_prompt_tokens,
+            restore_ids = _encode_ids(tok, restore_prompt),
+            original_output = outputs[-1],
+            context_pages = (int(restore_prompt_tokens.shape[-1]) - 1) // PAGE_SIZE,
+        )
 
-    info = types.SimpleNamespace(
-        gen = gen,
-        tokenizer = tok,
-        turn_texts = turn_texts,
-        outputs = outputs,
-        restore_prompt = restore_prompt,
-        restore_prompt_tokens = restore_prompt_tokens,
-        restore_ids = _encode_ids(tok, restore_prompt),
-        original_output = outputs[-1],
-        context_pages = (int(restore_prompt_tokens.shape[-1]) - 1) // PAGE_SIZE,
-    )
+        # Build both stores while the source is alive, THEN unload it. From here on the source no longer exists
+        # in any test body — every test operates from a copy of one of these two dirs.
 
-    # Build both stores while the source is alive, THEN unload it. From here on the source no longer exists
-    # in any test body — every test operates from a copy of one of these two dirs.
+        # BASE store: a plain save on the quiescent source; the verified copy every non-raced test uses.
+        base_dir = tmp_path_factory.mktemp("kvsave_base") / STORE_NAME
+        gen.save_state(str(base_dir))
+        info.base_store = base_dir
 
-    # BASE store: a plain save on the quiescent source; the verified copy every non-raced test uses.
-    base_dir = tmp_path_factory.mktemp("kvsave_base") / STORE_NAME
-    gen.save_state(str(base_dir))
-    info.base_store = base_dir
-
-    # RACED store: the exact save / defrag-race / serial-hygiene sequence test v performs, moved to fixture
-    # time so the defrag truly races the copy mid-capture. The race IS still exercised (that is test v's
-    # point); _force_defrag raises loudly if the cache was too unfragmented to rotate (failing the session
-    # rather than false-passing), while its False path — defrag() itself raised, e.g. an un-rotatable TP
-    # layout — is the test-v contract's accepted degradation where the structural gates still hold.
-    raced_dir = tmp_path_factory.mktemp("kvsave_raced") / STORE_NAME
-    serial_snapshot = _snapshot_serial_state(gen)
-    with _save_copy_stage_race(gen):
-        gen.save_state(str(raced_dir))
-    _restore_serial_state(gen, serial_snapshot)
-    info.raced_store = raced_dir
-
-    _unload(gen)
+        # RACED store: the exact save / defrag-race / serial-hygiene sequence test v performs, moved to fixture
+        # time so the defrag truly races the copy mid-capture. The race IS still exercised (that is test v's
+        # point); _force_defrag raises loudly if the cache was too unfragmented to rotate (failing the session
+        # rather than false-passing), while its False path — defrag() itself raised, e.g. an un-rotatable TP
+        # layout — is the test-v contract's accepted degradation where the structural gates still hold.
+        raced_dir = tmp_path_factory.mktemp("kvsave_raced") / STORE_NAME
+        serial_snapshot = _snapshot_serial_state(gen)
+        with _save_copy_stage_race(gen):
+            gen.save_state(str(raced_dir))
+        _restore_serial_state(gen, serial_snapshot)
+        info.raced_store = raced_dir
+    finally:
+        # Unload even when a store-build step raises, so a session-fixture error can never leak the resident
+        # model into the co-run bar (empirical: a leaked 205B made test_cache_rotate OOM on a 2 GiB tensor).
+        _unload(gen)
     info.gen = None          # source gone before the first test body — sanity property (spec §6)
     yield info
     if info.gen is not None:  # no-op in practice: the source is unloaded above the yield
