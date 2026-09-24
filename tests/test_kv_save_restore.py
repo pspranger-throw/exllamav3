@@ -426,8 +426,9 @@ def conversation(tmp_path_factory):
 
     # RACED store: the exact save / defrag-race / serial-hygiene sequence test v performs, moved to fixture
     # time so the defrag truly races the copy mid-capture. The race IS still exercised (that is test v's
-    # point); _force_defrag raises loudly if the cache was too unfragmented to rotate, failing the session
-    # rather than false-passing.
+    # point); _force_defrag raises loudly if the cache was too unfragmented to rotate (failing the session
+    # rather than false-passing), while its False path — defrag() itself raised, e.g. an un-rotatable TP
+    # layout — is the test-v contract's accepted degradation where the structural gates still hold.
     raced_dir = tmp_path_factory.mktemp("kvsave_raced") / STORE_NAME
     serial_snapshot = _snapshot_serial_state(gen)
     with _save_copy_stage_race(gen):
@@ -447,7 +448,7 @@ def _copy_store(src, dst):
     stores are each built once at session start from the single source generator; a test copies the one it
     needs into a fresh tmp_path so the body can tamper with (or restore from) the set without touching the
     session-level directory."""
-    shutil.copytree(str(src), str(dst), dirs_exist_ok = True)
+    return shutil.copytree(str(src), str(dst), dirs_exist_ok = True)
 
 
 @pytest.fixture
