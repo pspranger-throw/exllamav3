@@ -23,6 +23,7 @@ import unittest
 
 from exllamav3.generator.generator import Generator
 from exllamav3.generator.async_generator import AsyncGenerator
+from exllamav3.generator import kvstore
 
 
 class StubSyncGenerator:
@@ -184,6 +185,43 @@ class SavePassQ1Tests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_cancelled_future_skips_the_save(self):
+        """A request whose future is cancelled (timeout / client disconnect — Python 3.14 cancels
+        the future in all such paths, probe-verified 2026-09-25) must make the save pass SKIP the
+        snapshot entirely: no save_state call, no error latch, the request consumed cleanly."""
+        stub = StubSyncGenerator()
+
+        async def run():
+            ag = make_async_gen(stub)
+            fut = ag.request_save("/tmp/s")
+            fut.cancel()
+            await ag._notify_condition()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertIsNone(ag._save_request, "the save pass must consume the cancelled request")
+            self.assertIsNone(ag.error, "a cancelled save must not latch the generator failed")
+            await ag.close()
+
+        asyncio.run(run())
+        self.assertEqual(stub.save_calls, [], "a cancelled save future must skip the snapshot")
+
+    def test_close_fails_pending_save_with_a_catchable_exception(self):
+        """The iteration-task close path must fail the pending save future with an ordinary
+        Exception: a CancelledError instance (BaseException) escapes the endpoint's
+        `except Exception` and aborts the request without a status record (P2 review E2/R3)."""
+        stub = StubSyncGenerator()
+
+        async def run():
+            ag = make_async_gen(stub)
+            fut = ag.request_save("/tmp/s")
+            await ag.close()
+            with self.assertRaises(Exception) as ctx:
+                await fut
+            self.assertNotIsInstance(ctx.exception, asyncio.CancelledError,
+                                     "the future must fail with a catchable exception")
+
+        asyncio.run(run())
+
 
 class ZeroStashSkipPolicyTests(unittest.TestCase):
     """Generator.save_state policy: zero-stash captures are skipped (no dead sets)."""
@@ -242,6 +280,49 @@ class ZeroStashSkipPolicyTests(unittest.TestCase):
         stub.active_jobs = {"req": object()}
         with self.assertRaises(AssertionError):
             Generator.save_state(stub, "/tmp/kv/store")
+
+
+class StashBudgetResolutionTests(unittest.TestCase):
+    """`stash_budget_mb` must reach select_stashes exactly as configured (P2 review R4/F2/F3/E3):
+    0 is a legal value and must never silently become the 512 MiB default."""
+
+    def _run_enumerate(self, budget_bytes):
+        captured = {}
+        real_paged, real_devices, real_select = (
+            kvstore.paged_tensors, kvstore.device_set, kvstore.select_stashes)
+
+        def fake_select(items, budget = kvstore.STASH_BUDGET_DEFAULT):
+            captured["budget"] = budget
+            return real_select(items, budget = budget)
+
+        stub = types.SimpleNamespace(
+            pagetable = types.SimpleNamespace(all_pages = []),
+            cache = object(),
+            recurrent_cache = types.SimpleNamespace(items = lambda: [
+                ("old", {"checkpoint_size": 64}), ("new", {"checkpoint_size": 64})]),
+            _stash_budget_bytes = budget_bytes,
+        )
+        kvstore.paged_tensors = lambda cache: []
+        kvstore.device_set = lambda tensors: set()
+        kvstore.select_stashes = fake_select
+        try:
+            out = Generator._enumerate_store_targets(stub)
+        finally:
+            kvstore.paged_tensors, kvstore.device_set, kvstore.select_stashes = (
+                real_paged, real_devices, real_select)
+        return captured, out
+
+    def test_zero_budget_keeps_only_the_newest_stash(self):
+        captured, out = self._run_enumerate(0)
+        self.assertEqual(captured["budget"], 0,
+                         "stash_budget_mb=0 must reach select_stashes as 0, not the default")
+        self.assertEqual([k for k, _ in out["stashes"]], ["new"],
+                         "budget 0 keeps only the newest stash (select_stashes always-keep-newest)")
+
+    def test_none_budget_selects_the_default(self):
+        captured, out = self._run_enumerate(None)
+        self.assertEqual(captured["budget"], kvstore.STASH_BUDGET_DEFAULT)
+        self.assertEqual([k for k, _ in out["stashes"]], ["old", "new"])
 
 
 if __name__ == "__main__":
