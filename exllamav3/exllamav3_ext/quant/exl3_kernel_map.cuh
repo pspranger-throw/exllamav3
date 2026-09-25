@@ -2,11 +2,11 @@
 
 int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi);
 int exl3_gemm_num_kernel_shapes();
-bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
+bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits, bool half_k = false);
 // Dynamic shared memory (bytes) a (shape, bitrate) instantiation requests at launch
-int exl3_gemm_shape_smem(int shape_idx, int bits);
+int exl3_gemm_shape_smem(int shape_idx, int bits, bool half_k = false);
 // Throws if the shape does not fit the current device; for paths that bypass shape_compat
-void exl3_gemm_check_smem(int shape_idx, int bits, const char* who);
+void exl3_gemm_check_smem(int shape_idx, int bits, const char* who, bool half_k = false);
 
 // bits: integer part of the bitrate; half: bitrate is bits + 0.5 (mul1 codebook only, 16 * bits + 8 uint16 per tile)
 #define EXL3_GEMM_T_ARGS \
@@ -126,7 +126,7 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 // is a register-pipelining depth and does not affect shared memory.
 __host__ __device__ constexpr int exl3_gemm_smem_bytes(
     int tilesize_m, int tilesize_k, int tilesize_n, int sh_stages, int frag_stages,
-    int bits, bool shmem_out_had)
+    int bits, bool shmem_out_had, bool half_k = false)
 {
     (void) frag_stages;
     int tileblocks_k = tilesize_k / 16;
@@ -135,7 +135,9 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
     int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
 
     int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
-    int sh_b_stage_size = tileblocks_k * tileblocks_n * 256 / 16 * bits;       // uint16s
+    // mirrors TILE_U16 in exl3_gemm_inner.cuh: 16 * bits + (half_k ? 8 : 0) uint16s
+    // per 16x16 tile (half-integer bitrates carry a padded k-edge tile)
+    int sh_b_stage_size = tileblocks_k * tileblocks_n * (16 * bits + (half_k ? 8 : 0));
     int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m;  // floats (v1.5.0: reduction scratch scales with TILEBLOCKS_M)
     int sh_c_had = shmem_out_had ? tilesize_n * tilesize_m : 0;
     if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
@@ -146,18 +148,18 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
 // Same, addressed by shape index: expands the EXL3_GEMM_SHAPE_n macro so the tile dims and
 // stage count come from the one place they are declared, rather than a parallel table that
 // has to be updated by hand whenever a shape changes.
-#define EXL3_GEMM_SMEM_FOR_SHAPE(_shape, _bits, _had) \
-    exl3_gemm_smem_bytes(_shape, _bits, _had)
+#define EXL3_GEMM_SMEM_FOR_SHAPE(_shape, _bits, _had, _half_k) \
+    exl3_gemm_smem_bytes(_shape, _bits, _had, _half_k)
 
 __host__ __device__ constexpr int exl3_gemm_smem_bytes_for_shape(
-    int shape_idx, int bits, bool shmem_out_had)
+    int shape_idx, int bits, bool shmem_out_had, bool half_k = false)
 {
     switch (shape_idx)
     {
-        case 1: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_1, bits, shmem_out_had);
-        case 2: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_2, bits, shmem_out_had);
-        case 3: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_3, bits, shmem_out_had);
-        case 4: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_4, bits, shmem_out_had);
+        case 1: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_1, bits, shmem_out_had, half_k);
+        case 2: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_2, bits, shmem_out_had, half_k);
+        case 3: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_3, bits, shmem_out_had, half_k);
+        case 4: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_4, bits, shmem_out_had, half_k);
         default: return 0;
     }
 }

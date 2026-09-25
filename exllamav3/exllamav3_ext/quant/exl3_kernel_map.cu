@@ -91,12 +91,12 @@ int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
 // shmem_out_had = true: the GEMM path stages a full output tile for the fused output Hadamard,
 // which is the larger of the two sh_c variants, so this is the conservative bound for both it
 // and the MoE kernel (which passes false).
-int exl3_gemm_shape_smem(int shape_idx, int K)
+int exl3_gemm_shape_smem(int shape_idx, int K, bool half_k)
 {
-    return exl3_gemm_smem_bytes_for_shape(shape_idx, K, true);
+    return exl3_gemm_smem_bytes_for_shape(shape_idx, K, true, half_k);
 }
 
-bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K)
+bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K, bool half_k)
 {
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
@@ -107,17 +107,17 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     // host, where a 90 KB-capable device would otherwise vouch for a 64 KB one.
     int device;
     cudaGetDevice(&device);
-    return exl3_gemm_shape_smem(shape_idx, K) <= DevCtx::instance().get_smem_request(device);
+    return exl3_gemm_shape_smem(shape_idx, K, half_k) <= DevCtx::instance().get_smem_request(device);
 }
 
 // Hard gate for explicitly forced shapes, which skip the autotuner's shape_compat filter.
 // Launching a shape whose static layout exceeds what the launch can request would read past
 // the end of the extern __shared__ block - silent corruption rather than a failed launch.
-void exl3_gemm_check_smem(int shape_idx, int K, const char* who)
+void exl3_gemm_check_smem(int shape_idx, int K, const char* who, bool half_k)
 {
     int device;
     cudaGetDevice(&device);
-    int need = exl3_gemm_shape_smem(shape_idx, K);
+    int need = exl3_gemm_shape_smem(shape_idx, K, half_k);
     int have = DevCtx::instance().get_smem_request(device);
     TORCH_CHECK(need <= have, who, ": shape ", shape_idx, " at ", K,
                 " bpw needs ", need, " B of shared memory, device provides ", have);

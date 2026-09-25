@@ -82,9 +82,9 @@ void exl3_gemm_kernel_inner
     static_assert
     (
         exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES,
-                             bits, shmem_out_had)
+                             bits, shmem_out_had, half_k)
             == SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
-        "exl3_gemm_smem_bytes() disagrees with the kernel's shared memory layout"
+        "exl3_gemm_smem_bytes() disagrees with the kernel's shared memory layout (half_k)"
     );
 
     // Shared memory
