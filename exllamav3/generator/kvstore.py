@@ -22,8 +22,9 @@ import time
 import torch
 
 
-# Deepest-K stash budget, plan §2 (512 MiB). `save_state` carries no budget kwarg — the contract's
-# signature is exactly one positional store path — so the default lives at module level.
+# Deepest-K stash budget, plan §2 (512 MiB). The save-time override arrives as
+# `save_state(stash_budget_mb=...)` and is converted to bytes by the caller (None = this default;
+# 0 is legal and keeps only the newest stash, per select_stashes' always-keep-newest rule).
 STASH_BUDGET_DEFAULT = 512 * 1024 ** 2
 
 

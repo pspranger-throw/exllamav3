@@ -103,11 +103,14 @@ class AsyncGenerator:
 
         except asyncio.CancelledError:
             # A pending save will never run now; fail its future instead of leaving the caller to time out.
+            # The failure must be an ordinary Exception: a CancelledError instance set on the future
+            # escapes the endpoint's `except Exception` (CancelledError is a BaseException), leaving the
+            # request aborted and the status record unsettled (P2 review 2026-09-25, E2/R3/F4).
             if self._save_request is not None:
                 _, _, fut = self._save_request
                 self._save_request = None
                 if not fut.cancelled() and not fut.done():
-                    fut.set_exception(asyncio.CancelledError("iteration task closed before the save ran"))
+                    fut.set_exception(RuntimeError("iteration task closed before the save ran"))
             return
 
         except Exception as e:
@@ -173,6 +176,15 @@ class AsyncGenerator:
 
         # Force a re-check of the condition to unlock the loop
         await self._notify_condition()
+
+        # If the iteration task never got a first step (cancelled before it ever ran, so the
+        # in-body CancelledError handler never armed), settle a pending save here — an
+        # unresolved future hangs the caller forever (probe 2026-09-25, P2 review round).
+        if self._save_request is not None:
+            _, _, fut = self._save_request
+            self._save_request = None
+            if not fut.cancelled() and not fut.done():
+                fut.set_exception(RuntimeError("iteration task closed before the save ran"))
         try:
             await self.iteration_task
         except asyncio.CancelledError:
