@@ -257,11 +257,7 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
     // the int8 pipeline stages with cp.async (sm_80+); older devices decline
     // to the fp16 router path
-    {
-        cudaDeviceProp prop;
-        at::cuda::getDeviceProp(prop, hidden.get_device());
-        if (prop.major < 8) return false;
-    }
+    if (at::cuda::getDeviceProperties(hidden.get_device())->major < 8) return false;
     const int K = hidden.size(-1);
     return K % 16 == 0 && gate_i8.dim() == 3 && gate_i8.size(0) == 2 && gate_i8.size(2) == K && gate_sb.numel() == gate_i8.size(1);
 }
