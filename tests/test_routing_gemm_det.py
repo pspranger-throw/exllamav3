@@ -24,6 +24,10 @@ def quant_gate(gate):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (8, 0),
+    "routing_gemm_det uses cp.async (sm_80+); DEVICE cuda:0 is pre-sm_80",
+)
 class TestRoutingGemmDet(unittest.TestCase):
 
     def test_matches_reference(self):
@@ -49,22 +53,24 @@ class TestRoutingGemmDet(unittest.TestCase):
 
     def test_cross_device_identity(self):
         n = torch.cuda.device_count()
-        if n < 2:
-            self.skipTest("needs two or more GPUs")
+        # cp.async pipeline: only sm_80+ devices run this kernel (routing_gemm_det_fits)
+        devs = [d for d in range(n) if torch.cuda.get_device_capability(d) >= (8, 0)]
+        if len(devs) < 2:
+            self.skipTest("needs two or more sm_80+ GPUs")
         torch.manual_seed(3)
         K, E = 2560, 512
         gate = (torch.randn(K, E) * (1.0 / K ** 0.5)).half()
         for R in (2, 64, 65, 300, 1000):
             x = torch.randn(R, K).half()
             outs = []
-            for d in range(n):
+            for d in devs:
                 dev = torch.device(f"cuda:{d}")
                 _, g8, sb = quant_gate(gate.to(dev))
                 out = torch.empty(R, E, dtype = torch.half, device = dev)
                 ext.routing_gemm_det(x.to(dev), g8, sb, out)
                 outs.append(out.cpu())
-            for d in range(1, n):
-                self.assertTrue(torch.equal(outs[0], outs[d]), (R, torch.cuda.get_device_name(d)))
+            for d in range(1, len(devs)):
+                self.assertTrue(torch.equal(outs[0], outs[d]), (R, torch.cuda.get_device_name(devs[d])))
 
     def test_routing_std_multirow_selection(self):
         torch.manual_seed(2)

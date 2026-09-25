@@ -45,6 +45,9 @@ allocation on the host-bound decode path); larger calls allocate per call.
 // A (R, K) half -> hi/lo (R, K) int8, sa (R, KC) fp32. One thread per 16 k of one row; the 8
 // threads of a 128-chunk share the max by shuffle
 __global__ __launch_bounds__(256)
+// cp.async pipeline: sm_80+ only (pre-sm_80 passes compile these kernels empty;
+// routing_gemm_det_fits declines such devices and callers use the fp16 path)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 void quant_a_kernel(const half* __restrict__ a, signed char* __restrict__ ahi, signed char* __restrict__ alo,
                     float* __restrict__ sa, const int R, const int K, const int KC)
 {
@@ -78,8 +81,13 @@ void quant_a_kernel(const half* __restrict__ a, signed char* __restrict__ ahi, s
     }
     if (eighth == 0) sa[(size_t) row * KC + chunk] = __fdiv_rn(scale, DET_QMAX);
 }
+#endif  // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+
 
 __global__ __launch_bounds__(RG_THREADS)
+// cp.async pipeline: sm_80+ only (pre-sm_80 passes compile these kernels empty;
+// routing_gemm_det_fits declines such devices and callers use the fp16 path)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 void routing_gemm_i8_kernel
 (
     const signed char* __restrict__ ahi, const signed char* __restrict__ alo, const float* __restrict__ sa,   // (R, K), (R, K), (R, KC)
@@ -219,6 +227,8 @@ void routing_gemm_i8_kernel
         }
     }
 }
+#endif  // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+
 
 __global__ __launch_bounds__(256)
 void routing_gemm_reduce_kernel(const float* __restrict__ part, half* __restrict__ c, const int n, const int S)
@@ -247,6 +257,13 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
 {
     if (hidden.dtype() != at::kHalf || gate_i8.dtype() != at::kChar || gate_sb.dtype() != at::kFloat || scores.dtype() != at::kHalf) return false;
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
+    // the int8 pipeline stages with cp.async (sm_80+); older devices decline
+    // to the fp16 router path
+    {
+        cudaDeviceProp prop;
+        at::cuda::getDeviceProp(prop, hidden.get_device());
+        if (prop.major < 8) return false;
+    }
     const int K = hidden.size(-1);
     // The deterministic int8 kernels need cp.async and mma.m16n8k32 s8 (both sm_80+) and
     // 97 KB of dynamic smem, over the pre-Ampere ceiling; cuBLAS serves the other arches
