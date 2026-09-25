@@ -326,8 +326,13 @@ class GatedResidual(Module):
         # pre-quantized per row (14-bit fixed point split into two int8 slices, det_quant_weight)
         # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
         # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
-        self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
-            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda"
+        # cp.async inside the tiled kernels needs sm_80+; below that decline to the cuBLAS
+        # GEMM path (same math, hyperconnections.py GatedResidual._mix)
+        tiled_ok = (dev.type == "cuda" and not torch.version.hip
+                    and torch.cuda.get_device_capability(dev.index if dev.index is not None
+                                                         else torch.cuda.current_device()) >= (8, 0))
+        self.tiled = _gr_mix_tiled_enable and tiled_ok and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
+            and Mpad <= 512
         tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp") \
             .view(M, H * Dh)
         tmp.copy_(self.proj_h[: M])

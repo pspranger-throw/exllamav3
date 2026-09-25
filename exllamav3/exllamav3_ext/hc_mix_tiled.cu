@@ -6,6 +6,13 @@
 #include "util.cuh"
 #include "det_gemm.cuh"
 
+// The tiled kernels below use cp.async (sm_80+). Devices below that (Turing,
+// sm_75) never select this path: hyperconnections.py gates `tiled` on the
+// device capability and falls back to the cuBLAS GEMM mix. The guard keeps
+// the sm_75 compilation pass empty instead of failing ptxas; host code (no
+// __CUDA_ARCH__) compiles in full.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+
 /*
 
 Tiled, deterministic GatedResidual mix for prefill-sized row counts (hyperconnections.py
@@ -588,3 +595,5 @@ void gr_mix_tiled
     gr_gate_i8<<<grid_c, GATE_THREADS, GATE_SMEM, stream>>>(s_p, rmr_p, w_p, thi, tlo, ts_p, uhi, ulo, (const float*) up_sb.data_ptr(), mixed_p, R, D, LR);
     cuda_check(cudaPeekAtLastError());
 }
+
+#endif  // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
