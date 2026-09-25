@@ -195,7 +195,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K + (half_k ? 1 : 0), false, 1, 1) : force_shape_idx;
 
     TORCH_CHECK(shape_idx > 0 && shape_idx <= EXL3_GEMM_NUM_SHAPES, "exl3_gemm: no compatible kernel (or invalid forced shape index)");
-    exl3_gemm_check_smem(shape_idx, K, "exl3_gemm");
+    exl3_gemm_check_smem(shape_idx, K, "exl3_gemm", half_k);
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 
@@ -231,7 +231,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K + (half_k ? 1 : 0), true, bszm_in, bszm_out) : force_shape_idx;
     TORCH_CHECK(shape_idx > 0, "exl3_mgemm: no compatible kernel");
-    exl3_gemm_check_smem(shape_idx, K, "exl3_mgemm");
+    exl3_gemm_check_smem(shape_idx, K, "exl3_mgemm", half_k);
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 

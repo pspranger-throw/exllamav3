@@ -271,7 +271,7 @@ bool exl3_gemv_int8
     // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
     // declining is a performance loss and nothing more.
     if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
- (fix review findings: int8 GEMV smem abort, quant-cache dispatch dead-end, forced-shape smem check)
+
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
