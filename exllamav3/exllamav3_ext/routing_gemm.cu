@@ -43,12 +43,11 @@ allocation on the host-bound decode path); larger calls allocate per call.
 // A (R, K) half -> hi/lo (R, K) int8, sa (R, KC) fp32. One thread per 16 k of one row; the 8
 // threads of a 128-chunk share the max by shuffle
 __global__ __launch_bounds__(256)
-// cp.async pipeline: sm_80+ only (pre-sm_80 passes compile these kernels empty;
-// routing_gemm_det_fits declines such devices and callers use the fp16 path)
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 void quant_a_kernel(const half* __restrict__ a, signed char* __restrict__ ahi, signed char* __restrict__ alo,
                     float* __restrict__ sa, const int R, const int K, const int KC)
 {
+#if __CUDA_ARCH__ >= 800   // sm75: empty body; routing_gemm_det_fits declines pre-sm_80
+
     const int idx = blockIdx.x * 256 + threadIdx.x;
     const int eighth = idx & 7, chunk = (idx >> 3) % KC, row = (idx >> 3) / KC;
     if (row >= R) return;
@@ -78,14 +77,10 @@ void quant_a_kernel(const half* __restrict__ a, signed char* __restrict__ ahi, s
         *(int4*) (alo + (size_t) row * K + k) = lo4;
     }
     if (eighth == 0) sa[(size_t) row * KC + chunk] = __fdiv_rn(scale, DET_QMAX);
+#endif  // __CUDA_ARCH__ >= 800
 }
-#endif  // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-
 
 __global__ __launch_bounds__(RG_THREADS)
-// cp.async pipeline: sm_80+ only (pre-sm_80 passes compile these kernels empty;
-// routing_gemm_det_fits declines such devices and callers use the fp16 path)
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 void routing_gemm_i8_kernel
 (
     const signed char* __restrict__ ahi, const signed char* __restrict__ alo, const float* __restrict__ sa,   // (R, K), (R, K), (R, KC)
@@ -94,6 +89,8 @@ void routing_gemm_i8_kernel
     const int R, const int E, const int K, const int KC, const int kslice
 )
 {
+#if __CUDA_ARCH__ >= 800   // sm75: empty body; routing_gemm_det_fits declines pre-sm_80
+
     extern __shared__ __align__(128) unsigned char dsm[];
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
     const int wm = warp / 4, wn = warp % 4;
@@ -224,9 +221,8 @@ void routing_gemm_i8_kernel
             else c[(size_t) (r0 + i) * E + e0 + j] = __float2half_rn(v);
         }
     }
+#endif  // __CUDA_ARCH__ >= 800
 }
-#endif  // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-
 
 __global__ __launch_bounds__(256)
 void routing_gemm_reduce_kernel(const float* __restrict__ part, half* __restrict__ c, const int n, const int S)
