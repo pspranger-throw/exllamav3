@@ -1701,8 +1701,8 @@ class Generator:
         fully landed.
 
         `stash_budget_mb` caps how many recurrent checkpoints (deepest-first) the store keeps;
-        None = `kvstore.STASH_BUDGET_DEFAULT` (512 MiB). The budget is a SAVE-time knob only —
-        restore replays whatever the set carries.
+        None = `kvstore.STASH_BUDGET_DEFAULT` (512 MiB), 0 = keep only the newest stash. The budget
+        is a SAVE-time knob only — restore replays whatever the set carries.
 
         ZERO-STASH SAVES ARE SKIPPED (user decision 2026-09-24, "no dead sets"): a capture with no
         recurrent checkpoint can never restore anything on a hybrid model (the anchor clamp pins
@@ -1813,7 +1813,10 @@ class Generator:
 
         stashes = []
         if self.recurrent_cache is not None:
-            budget = getattr(self, "_stash_budget_bytes", None) or kvstore.STASH_BUDGET_DEFAULT
+            # 0 is a legal budget (keeps only the newest stash — select_stashes always keeps the
+            # newest): an `or` here would silently turn it into the 512 MiB default (P2 review).
+            budget = kvstore.STASH_BUDGET_DEFAULT if getattr(self, "_stash_budget_bytes", None) is None \
+                else self._stash_budget_bytes
             stashes = kvstore.select_stashes(list(self.recurrent_cache.items()), budget = budget)
         deepest_key = stashes[-1][0] if stashes else None
 
@@ -1948,7 +1951,10 @@ class Generator:
         (tabbyAPI's create_generator path in P2) catches the exception and continues COLD. No VALIDATION
         failure mutates the pool: every check — including per-entry prev_hash/tokens payloads — runs in
         the pre-mutation pass before the first write. A non-validation failure (I/O, a torch/CUDA error
-        mid-copy) is reported to the caller as-is, with the pool in whatever partial state it reached.
+        mid-copy) triggers a best-effort reset of the pool to the fresh state (`reset_page_table` +
+        stash drain) before the exception is re-raised, so the caller's fail-closed-to-COLD contract
+        holds for that class too; if the reset itself fails it is logged loudly and the original
+        exception still propagates.
 
         The pool starts empty — a fresh PageTable keys every page by a random placeholder hash
         (pagetable.py:350-380) — so restoring is idempotent by construction: a recreated generator
@@ -2085,54 +2091,61 @@ class Generator:
                 if off < 0 or off + nbytes > pages_pinned.numel():
                     raise RuntimeError("chain entry tensor bytes fall outside pages.bin")
 
-        with torch.inference_mode():
-            for e in chain["entries"]:
-                phash = bytes.fromhex(e["phash"])
-                prev_hash = bytes.fromhex(e["prev_hash"]) if e["prev_hash"] is not None else None
-                page = None
-                old_phash = None
-                for cand_phash, cand in pool:
-                    if cand.page_index not in used_idx and cand.ref_count == 0:
-                        page, old_phash = cand, cand_phash
-                        break
-                assert page is not None, \
-                    "no unreferenced page left to restore into: the store is larger than this pool"
-                used_idx.add(page.page_index)
-                del pt.unreferenced_pages[old_phash]
+        try:
+            with torch.inference_mode():
+                for e in chain["entries"]:
+                    phash = bytes.fromhex(e["phash"])
+                    prev_hash = bytes.fromhex(e["prev_hash"]) if e["prev_hash"] is not None else None
+                    page = None
+                    old_phash = None
+                    for cand_phash, cand in pool:
+                        if cand.page_index not in used_idx and cand.ref_count == 0:
+                            page, old_phash = cand, cand_phash
+                            break
+                    assert page is not None, \
+                        "no unreferenced page left to restore into: the store is larger than this pool"
+                    used_idx.add(page.page_index)
+                    del pt.unreferenced_pages[old_phash]
 
-                page.phash = phash;                   page.phash_revert = phash
-                page.prev_hash = prev_hash;           page.prev_hash_revert = prev_hash
-                serial += 1
-                page.access_serial = serial;          page.access_serial_revert = serial
-                page.kv_position = PAGE_SIZE;         page.kv_position_revert = PAGE_SIZE
-                page.can_revert = False
-                page.sequence.copy_(torch.tensor([e["tokens"]], dtype = torch.long))
+                    page.phash = phash;                   page.phash_revert = phash
+                    page.prev_hash = prev_hash;           page.prev_hash_revert = prev_hash
+                    serial += 1
+                    page.access_serial = serial;          page.access_serial_revert = serial
+                    page.kv_position = PAGE_SIZE;         page.kv_position_revert = PAGE_SIZE
+                    page.can_revert = False
+                    page.sequence.copy_(torch.tensor([e["tokens"]], dtype = torch.long))
 
-                assert phash not in pt.unreferenced_pages and phash not in pt.referenced_pages, \
-                    "restored content hash collides with a page already in the pool"
-                pt.unreferenced_pages[phash] = page
+                    assert phash not in pt.unreferenced_pages and phash not in pt.referenced_pages, \
+                        "restored content hash collides with a page already in the pool"
+                    pt.unreferenced_pages[phash] = page
 
-                for ct, desc in zip(tensors, e["tensors"]):
-                    off, nbytes, shape, dtype_str = desc[0], desc[1], desc[2], desc[3]
-                    assert list(ct[0].shape) == shape and \
-                           str(ct.dtype).replace("torch.", "") == dtype_str, \
-                           "restored tensor slot does not match the live cache tensor"
-                    cpu_view = pages_pinned[off:off + nbytes].view(getattr(torch, dtype_str)).view(shape)
-                    ct[page.page_index].copy_(cpu_view, non_blocking = True)
-                restored += 1
-            pt.access_serial = serial
-        kvstore.sync_devices(devices)
+                    for ct, desc in zip(tensors, e["tensors"]):
+                        off, nbytes, shape, dtype_str = desc[0], desc[1], desc[2], desc[3]
+                        assert list(ct[0].shape) == shape and \
+                               str(ct.dtype).replace("torch.", "") == dtype_str, \
+                               "restored tensor slot does not match the live cache tensor"
+                        cpu_view = pages_pinned[off:off + nbytes].view(getattr(torch, dtype_str)).view(shape)
+                        ct[page.page_index].copy_(cpu_view, non_blocking = True)
+                    restored += 1
+                pt.access_serial = serial
+            kvstore.sync_devices(devices)
 
-        rc = self.recurrent_cache
-        put = 0
-        if rc is not None:
-            for sm in meta["stashes"]:
-                with open(os.path.join(d, sm["file"]), "rb") as f:
-                    raw = f.read()
-                state = {"position": sm["position"], "checkpoint_size": sm["checkpoint_size"]}
-                state.update(kvstore.stash_state_from_blob(raw, sm["tensors"]))
-                rc.put(bytes.fromhex(sm["phash"]), kvstore.PreStashed(state))
-                put += 1
+            rc = self.recurrent_cache
+            put = 0
+            if rc is not None:
+                for sm in meta["stashes"]:
+                    with open(os.path.join(d, sm["file"]), "rb") as f:
+                        raw = f.read()
+                    state = {"position": sm["position"], "checkpoint_size": sm["checkpoint_size"]}
+                    state.update(kvstore.stash_state_from_blob(raw, sm["tensors"]))
+                    rc.put(bytes.fromhex(sm["phash"]), kvstore.PreStashed(state))
+                    put += 1
+        except Exception:
+            # Mid-copy class (the validation class never mutates, so it never reaches here):
+            # return the pool to the fresh state so no half-stamped page can ever be matched and
+            # served (a page registered before all its tensors landed would serve wrong KV).
+            self._reset_pool_after_failed_restore()
+            raise
 
         return {
             "pages_restored": restored,
@@ -2141,3 +2154,33 @@ class Generator:
             "stash_keys": [bytes.fromhex(s["phash"]) for s in meta["stashes"]],
             "meta": meta,
         }
+
+    def _reset_pool_after_failed_restore(self):
+        """
+        Best-effort return to the fresh-pool state after a mid-restore (non-validation) failure.
+
+        restore_state runs on a fresh generator before anything is served, so resetting here cannot
+        disturb live work; it only guarantees that a half-stamped page is never matchable after the
+        failure (silent wrong-KV hazard). Each step is individually guarded: this must never mask the
+        original restore exception.
+        """
+        try:
+            self.pagetable.reset_page_table()
+        except Exception:
+            logger.error("kv restore cleanup: reset_page_table FAILED — the pool may hold "
+                         "partially restored pages and must not be trusted")
+            return
+        rc = self.recurrent_cache
+        if rc is not None:
+            try:
+                while rc:
+                    _k, popped = rc.popitem(last = False)
+                    if isinstance(popped, dict):
+                        from ..cache.recurrent import note_freed
+                        note_freed(int(popped.get("checkpoint_size", 0)))
+                rc.current_size = 0
+            except Exception:
+                logger.error("kv restore cleanup: recurrent-cache drain FAILED — leftover "
+                             "restore stashes may remain")
+        logger.warning("kv restore cleanup: pool reset to fresh state after failed restore "
+                       "(serving COLD)")
