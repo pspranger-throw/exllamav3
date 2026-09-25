@@ -15,7 +15,10 @@ These run without CUDA; the model-bearing acceptance remains the P1 suite
 import asyncio
 import sys
 import os
+import json
+import tempfile
 import types
+from collections import OrderedDict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -323,6 +326,87 @@ class StashBudgetResolutionTests(unittest.TestCase):
         captured, out = self._run_enumerate(None)
         self.assertEqual(captured["budget"], kvstore.STASH_BUDGET_DEFAULT)
         self.assertEqual([k for k, _ in out["stashes"]], ["old", "new"])
+
+
+class RestoreMutationCleanupTests(unittest.TestCase):
+    """Mid-copy restore failure must best-effort reset the pool and re-raise unchanged (P2
+    review fix 6): a half-stamped page must never stay matchable after a failed restore."""
+
+    def _stub_self(self, reset_raises = False):
+        calls = {"reset": 0}
+
+        def reset():
+            calls["reset"] += 1
+            if reset_raises:
+                raise RuntimeError("reset exploded")
+
+        pt = types.SimpleNamespace(
+            unreferenced_pages = {}, referenced_pages = {}, access_serial = 0,
+            reset_page_table = reset,
+        )
+        rc = OrderedDict()
+        rc["k1"] = {"checkpoint_size": 64}
+        stub = types.SimpleNamespace(
+            pagetable = pt,
+            cache = object(),
+            recurrent_cache = rc,
+            _store_pin_derivers = lambda: {"page_size": lambda: 1},
+            _store_extra_pins = lambda: {},
+        )
+        stub._reset_pool_after_failed_restore = types.MethodType(
+            Generator._reset_pool_after_failed_restore, stub)
+        return stub, calls
+
+    def _write_store(self, d):
+        meta = {
+            "files": {
+                "pages.bin": {"sha256": "aa", "size": 0},
+                "chain.json": {"sha256": "bb", "size": 0},
+            },
+            "pins": {"page_size": 1},
+            "checks": {"chain_complete": True, "anchor_in_chain": True},
+            "stashes": [],
+            "deepest_anchor_page_idx": -1,
+        }
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        with open(os.path.join(d, "chain.json"), "w") as f:
+            json.dump({"page_size": 1, "entries": []}, f)
+        open(os.path.join(d, "pages.bin"), "wb").close()
+
+    def test_midcopy_failure_resets_pool_and_reraises(self):
+        real_validate = kvstore.validate_store_dir
+        real_sync = kvstore.sync_devices
+        real_paged = kvstore.paged_tensors
+        real_devices = kvstore.device_set
+        kvstore.validate_store_dir = lambda d, files: None
+        kvstore.paged_tensors = lambda cache: []
+        kvstore.device_set = lambda tensors: set()
+
+        def boom(devices):
+            raise RuntimeError("mid-copy fault")
+
+        kvstore.sync_devices = boom
+        stub, calls = self._stub_self()
+        with tempfile.TemporaryDirectory() as d:
+            self._write_store(d)
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    Generator.restore_state(stub, d)
+            finally:
+                kvstore.validate_store_dir = real_validate
+                kvstore.sync_devices = real_sync
+                kvstore.paged_tensors = real_paged
+                kvstore.device_set = real_devices
+        self.assertEqual(str(ctx.exception), "mid-copy fault",
+                         "the original mutation-phase exception must propagate unchanged")
+        self.assertEqual(calls["reset"], 1, "the fresh-pool reset must run on a mutation-phase failure")
+        self.assertEqual(dict(stub.recurrent_cache), {}, "restore stashes must be drained")
+
+    def test_reset_helper_never_masks_a_failure(self):
+        stub, calls = self._stub_self(reset_raises = True)
+        Generator._reset_pool_after_failed_restore(stub)  # must not raise
+        self.assertEqual(calls["reset"], 1)
 
 
 if __name__ == "__main__":
