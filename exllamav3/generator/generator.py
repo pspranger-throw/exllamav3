@@ -20,8 +20,11 @@ from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
 import threading
+import json
+import os
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+from . import kvstore
 
 class Generator:
 
@@ -1627,3 +1630,557 @@ class Generator:
             return completions, last_results
         else:
             return completions
+
+
+    # ============================================================================================ #
+    # KV session store — save_state / restore_state (kv-persistence P1)                            #
+    #                                                                                              #
+    # Mechanics (hashes, chain order, stash budget, digests, atomic publish, pin derivation) live   #
+    # in generator/kvstore.py, ported from the proven P0 oracle                                    #
+    # ~/issues/local-llm/hosting/kv-persistence/probes/probe_lib.py. Only the Q1-safe sequencing    #
+    # and the page-table/recurrent-cache stamping are engine code, and they are here.              #
+    # ============================================================================================ #
+
+
+    def _store_pin_derivers(self) -> dict:
+        """
+        Ordered key -> callable, THE single derivation of the store pins, used by BOTH sides: save
+        stamps exactly these values, restore re-derives them from its own live objects and compares.
+        Sharing one derivation is what makes a round trip validate by construction while a
+        cross-layout restore still rejects, and it means no pin is ever a hardcoded constant or a
+        silently-None placeholder.
+
+        Insertion order IS the validation order and is load-bearing: the pool-shape keys
+        (cache_size, cache_mode, tensor_manifest) are checked first because they are what a mismatched
+        target most often trips and what the acceptance messages key on, and they must be reported
+        before any key whose derivation can fail for purely environmental reasons (fork_revision).
+        """
+        return {
+            "cache_size": lambda: int(self.cache.max_num_tokens),
+            "cache_mode": lambda: kvstore.cache_mode_of(self.cache),
+            "tensor_manifest": lambda: kvstore.tensor_manifest(self.cache),
+            "model_dir": lambda: self.model.config.directory,
+            "gpu_split": lambda: kvstore.derive_gpu_split(self.cache),
+            "page_size": lambda: PAGE_SIZE,
+            "version": lambda: kvstore.engine_version(),
+            "fork_revision": lambda: kvstore.engine_fork_revision(),
+        }
+
+
+    def _store_pin_values(self) -> dict:
+        """Materialise the pin dict to stamp into meta.json (core pins + the plan §2 extras)."""
+        pins = {key: derive() for key, derive in self._store_pin_derivers().items()}
+        pins.update(self._store_extra_pins())
+        return pins
+
+
+    def _store_extra_pins(self) -> dict:
+        """
+        The plan §2 extras, stamped only when derivable from live objects — omitted rather than
+        invented, so a store never carries a placeholder that restore would compare as equal.
+        `model_name` is deliberately absent: this fork's Config exposes no such attribute, and a name
+        guessed from the directory basename would be a constant pretending to be a pin.
+        """
+        extras = {}
+        mpe = getattr(self.model.config, "max_position_embeddings", None)
+        if mpe is not None:
+            extras["max_seq_len"] = int(mpe)
+        mcs = getattr(self.model.config.infer_params, "moe_cpu_split", None)
+        if mcs is not None:
+            extras["cpu_moe_split_experts"] = int(mcs)
+        return extras
+
+
+    def save_state(self, store: str, stash_budget_mb: int | None = None) -> dict:
+        """
+        Serialise this generator's paged KV cache and recurrent checkpoints into a store directory.
+
+        `store` is the FINAL store directory (e.g. /tmp/x/session), not a parent+name pair. It is
+        built in a sibling temp dir and published with an atomic rename, so a crash mid-save never
+        leaves a partial set at `store`, and a previously published set survives until the new one has
+        fully landed.
+
+        `stash_budget_mb` caps how many recurrent checkpoints (deepest-first) the store keeps;
+        None = `kvstore.STASH_BUDGET_DEFAULT` (512 MiB), 0 = keep only the newest stash. The budget
+        is a SAVE-time knob only — restore replays whatever the set carries.
+
+        ZERO-STASH SAVES ARE SKIPPED (user decision 2026-09-24, "no dead sets"): a capture with no
+        recurrent checkpoint can never restore anything on a hybrid model (the anchor clamp pins
+        `restore_limit` to the deepest stashed checkpoint), so writing such a set would only produce a
+        store that restore must reject. On skip, nothing is written, nothing existing is touched, and
+        the return dict carries `skipped = "zero-stash"` (loud `WARNING` here + the caller's own log).
+
+        The snapshot is a quiescent, point-in-time read split into two wrappable stages:
+
+            self._save_targets = self._enumerate_store_targets()   # defrag-invariant metadata only
+            self._copy_store_targets(store)                        # fresh page_index, D2H, files
+
+        Enumerate captures no `page_index`, no KV bytes, no byte offsets and no serial values; copy
+        resolves `page.page_index` at copy time. That fresh resolution is the load-bearing defrag
+        immunity: a repagination landing between the two stages moves a page's KV to a new physical
+        index, and copying an enumerated index instead would store page B's bytes under page A's hash
+        — a silent page mix that no digest could see, not even `validate_pagetable()`, because the
+        content hash covers token ids only (pagetable.py:23-28).
+
+        Read-only on cache tensors (device-to-host only) and serial-inert: nothing here writes
+        `access_serial`, `last_defrag_serial` or a per-page serial, so saving cannot perturb LRU or
+        defrag ordering. It is therefore safe to call outside `torch.inference_mode()` and outside an
+        event loop, which is what the P1 acceptance fixture does.
+
+        Greedy generation on this engine is not bit-reproducible (F-N1), so nothing here claims — and
+        no caller should expect — text parity across a save/restore round trip. The store's contract
+        is the mechanism state (pages, chain, stashes), not decoded text.
+
+        Precondition (fail-loud on programmer error, not a runtime branch): the generator must be
+        quiescent — no pending and no active jobs. In production tabbyAPI's 409 gate plus the
+        iteration-task ordering give this; asserting it here keeps a non-quiescent save from ever
+        being attempted, because a snapshot taken while a job holds or is about to free pages is not a
+        snapshot of anything coherent.
+        """
+        assert not self.pending_jobs and not self.active_jobs, \
+            "save_state() called on a non-quiescent generator: the snapshot must be taken with no " \
+            "pending and no active jobs (Q1). Saving while work is in flight is a programming error."
+        budget_bytes = None
+        if stash_budget_mb is not None:
+            budget_bytes = int(stash_budget_mb) * 1024 ** 2
+        self._stash_budget_bytes = budget_bytes
+        self._save_targets = self._enumerate_store_targets()
+        if not self._save_targets["stashes"]:
+            n_pages = len(self._save_targets["targets"])
+            logger.warning(
+                "kv save skipped (zero-stash): %d page(s) captured but no recurrent checkpoint — "
+                "a pages-only store cannot restore on a hybrid model (anchor clamp); nothing written "
+                "to %s", n_pages, store)
+            return {
+                "dir": None,
+                "skipped": "zero-stash",
+                "n_pages": n_pages,
+                "n_stashes": 0,
+                "stash_keys": [],
+                "checks": None,
+                "meta": None,
+                "deepest_anchor_page_idx": -1,
+            }
+        return self._copy_store_targets(store)
+
+
+    def _enumerate_store_targets(self) -> dict:
+        """
+        Stage 1 of `save_state`: record what the store will contain, without recording anything a
+        defragmentation can lawfully change.
+
+        Defrag rewrites only `page.page_index` and moves KV between physical indices
+        (pagetable.py:1028-1029), plus re-sorting orphan serials (pagetable.py:943-946), so this stage
+        carries no page_index, no KV bytes, no byte offsets and no serial values. It carries a
+        reference to each live `CachePage` object instead — that object is the handle stage 2 resolves
+        `page_index` through, which is what makes the capture immune to a repagination at the
+        enumerate->copy boundary.
+
+        Captured, all of it defrag-invariant:
+          * the page set: complete, content-hashed pages (`kv_position == PAGE_SIZE and
+            is_content_hash(phash)`, the pagetable.py:39-42 test that excludes the random placeholder
+            hash a fresh or cleared page carries), ordered root->leaf, plus the gap list;
+          * per target: phash, prev_hash, `page.sequence[0].tolist()` — `sequence` is allocated on the
+            host (pagetable.py:366), so this is the "sequence moved to host before serialisation" step
+            and not a device read — and the page object reference;
+          * stashes: `list(recurrent_cache.items())` is an OrderedDict in oldest->newest order and
+            `items()` does not disturb LRU (only `get_stashed`/`put`/`move_to_end` do,
+            cache/recurrent.py:42-91), narrowed to the deepest-K within
+            `kvstore.STASH_BUDGET_DEFAULT` (512 MiB, plan §2). These are host-side dicts, so again no
+            device read is involved. A capture with zero stashes stamps `anchor_in_chain = False` and
+            is therefore rejected at restore (loud, cold) — v1 assumes a recurrent model with at least
+            one checkpoint by save time (P4 watch item);
+          * the paged tensor list and the device set the copies must sync before any digest is taken.
+            The (shape, dtype) manifest is deliberately NOT carried here: it is defrag-invariant, and
+            stamping derives it from the live cache through the single pin derivation.
+        """
+        pt = self.pagetable
+        cache = self.cache
+        tensors = kvstore.paged_tensors(cache)
+        devices = kvstore.device_set(tensors)
+
+        pages = [p for p in pt.all_pages if p.kv_position == PAGE_SIZE and is_content_hash(p.phash)]
+        order, gaps, by_hash = kvstore.chain_order(pages)
+        targets = []
+        for phash in order:
+            page = by_hash[phash]
+            targets.append({
+                "phash": phash,
+                "prev_hash": page.prev_hash,
+                "tokens": page.sequence[0].tolist(),
+                "page": page,
+            })
+
+        stashes = []
+        if self.recurrent_cache is not None:
+            # 0 is a legal budget (keeps only the newest stash — select_stashes always keeps the
+            # newest): an `or` here would silently turn it into the 512 MiB default (P2 review).
+            budget = kvstore.STASH_BUDGET_DEFAULT if getattr(self, "_stash_budget_bytes", None) is None \
+                else self._stash_budget_bytes
+            stashes = kvstore.select_stashes(list(self.recurrent_cache.items()), budget = budget)
+        deepest_key = stashes[-1][0] if stashes else None
+
+        return {
+            "targets": targets,
+            "gaps": gaps,
+            "stashes": stashes,
+            "tensors": tensors,
+            "devices": devices,
+            "deepest_anchor_key": deepest_key,
+            "deepest_anchor_page_idx": order.index(deepest_key) if deepest_key in order else -1,
+        }
+
+
+    def _copy_store_targets(self, store: str) -> dict:
+        """
+        Stage 2 of `save_state`: copy the enumerated targets' bytes into the store.
+
+        This is the seam `test_v_defrag_race_q1` wraps to force a live defrag at the enumerate->copy
+        boundary. Every `page.page_index` is resolved HERE, from the live page object, after whatever
+        the race did. The device-to-host copies mirror the CPU page tier (generator/cpu_cache.py:297
+        -299: pinned destination, `copy_(..., non_blocking = True)`), and `torch.cuda.synchronize()`
+        then runs on EVERY device holding cache tensors — both cards of a split, never just the current
+        device — before a single digest is computed.
+
+        Write order is fixed by the acceptance contract: pages.bin (page images concatenated in chain
+        order) + chain.json (root->leaf) + stash-*.bin (oldest->newest, so restore's `put()` loop
+        rebuilds LRU in true recency order); then sha256+size over ALL staged files INCLUDING
+        chain.json, so a tampered chain.json fails Layer-A at restore rather than silently restoring a
+        wrong chain; then meta.json LAST; then the atomic publish. Nothing here ever deletes a store —
+        a set that fails validation at restore is kept for forensics. The staging dir is re-created
+        clean of any residue a crashed earlier save left under this process name, so a stale file can
+        never be digested into a new set.
+        """
+        t = self._save_targets
+        targets = t["targets"]
+        tensors = t["tensors"]
+        devices = t["devices"]
+
+        blobs = []
+        entries = []
+        off = 0
+        for tgt in targets:
+            page = tgt["page"]
+            page_index = page.page_index          # resolved NOW — this line is the defrag immunity
+            descs = []
+            for ct in tensors:
+                dst = torch.empty(ct[page_index].shape, dtype = ct.dtype, pin_memory = True)
+                dst.copy_(ct[page_index], non_blocking = True)
+                nbytes = int(ct[0].numel()) * int(ct.element_size())
+                blobs.append((dst, off))
+                descs.append([off, nbytes, list(ct[0].shape), str(ct.dtype).replace("torch.", "")])
+                off += nbytes
+            entries.append({
+                "phash": tgt["phash"].hex(),
+                "prev_hash": tgt["prev_hash"].hex() if tgt["prev_hash"] is not None else None,
+                "tokens": tgt["tokens"],
+                "tensors": descs,
+            })
+        kvstore.sync_devices(devices)
+        pages_blob = b"".join(kvstore.tensor_bytes(d) for d, _ in blobs)
+        del blobs
+
+        final = os.path.abspath(store)
+        parent = os.path.dirname(final)
+        os.makedirs(parent, exist_ok = True)
+        stage = kvstore.prepare_stage(parent, final)
+
+        with open(os.path.join(stage, "pages.bin"), "wb") as f:
+            f.write(pages_blob)
+        del pages_blob
+        with open(os.path.join(stage, "chain.json"), "w") as f:
+            json.dump({"page_size": PAGE_SIZE, "entries": entries}, f)
+
+        stashes_meta = []
+        for si, (key, state) in enumerate(t["stashes"]):
+            blob, tdesc = kvstore.stash_blob(state)
+            fname = f"stash-{si}.bin"
+            with open(os.path.join(stage, fname), "wb") as f:
+                f.write(blob)
+            stashes_meta.append({
+                "file": fname,
+                "phash": key.hex(),
+                "position": int(state["position"]),
+                "checkpoint_size": int(state["checkpoint_size"]),
+                "tensors": tdesc,
+            })
+
+        checks = {
+            "chain_complete": not t["gaps"],
+            "chain_gaps": [g.hex() for g in t["gaps"]],
+            "anchor_in_chain": t["deepest_anchor_key"] is not None and
+                               t["deepest_anchor_key"] in [x["phash"] for x in targets],
+        }
+        meta = {
+            "pins": self._store_pin_values(),
+            "files": kvstore.digest_dir(stage),
+            "stashes": stashes_meta,
+            "checks": checks,
+            "metrics": {
+                "pagetable": dict(self.pagetable.metrics),
+                "recurrent": dict(self.recurrent_cache.metrics) if self.recurrent_cache is not None else {},
+            },
+            "deepest_anchor_page_idx": t["deepest_anchor_page_idx"],
+            "n_pages": len(entries),
+            "n_stashes": len(stashes_meta),
+            "captured_at": kvstore.now_stamp(),
+            "extras": {},
+        }
+        with open(os.path.join(stage, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        kvstore.stage_atomic_rename(stage, final)
+
+        return {
+            "dir": final,
+            "n_pages": len(entries),
+            "n_stashes": len(stashes_meta),
+            "stash_keys": [k for k, _ in t["stashes"]],
+            "checks": checks,
+            "meta": meta,
+            "deepest_anchor_page_idx": t["deepest_anchor_page_idx"],
+        }
+
+
+    def restore_state(self, store: str) -> dict:
+        """
+        Eagerly reload a store produced by `save_state` into this generator's pool.
+
+        Fail-closed and atomic. EVERY check — file digests/sizes, pins, the capture-time chain gates,
+        the stash/presence gate — runs before a single page or stash is touched, and the store
+        directory is never modified, so a rejected store is kept intact for forensics and the caller
+        (tabbyAPI's create_generator path in P2) catches the exception and continues COLD. No VALIDATION
+        failure mutates the pool: every check — including per-entry prev_hash/tokens payloads — runs in
+        the pre-mutation pass before the first write. A non-validation failure (I/O, a torch/CUDA error
+        mid-copy) triggers a best-effort reset of the pool to the fresh state (`reset_page_table` +
+        stash drain) before the exception is re-raised, so the caller's fail-closed-to-COLD contract
+        holds for that class too; if the reset itself fails it is logged loudly and the original
+        exception still propagates.
+
+        The pool starts empty — a fresh PageTable keys every page by a random placeholder hash
+        (pagetable.py:350-380) — so restoring is idempotent by construction: a recreated generator
+        restamps a clean pool, and restoring twice into the same generator is a programmer error the
+        pre-mutation collision check surfaces before any page is touched, rather than silently
+        corrupting the pool.
+
+        Stamping mirrors `add_ref_clear` (pagetable.py:136-146), the live path's own page-repurpose
+        write set, plus the revert twins. `can_revert` is kept False, because `revert()` asserts it
+        (pagetable.py:110-121) and a restored page has nothing to revert to. Each page is registered in
+        `unreferenced_pages`, NOT `referenced_pages`: that is what makes a restored prefix usable with
+        no cache tier at all, because `get_live_page` consults both dicts and requires
+        `kv_position == PAGE_SIZE` (pagetable.py:519-526) and `is_resumable` resolves through it
+        (pagetable.py:659-680).
+
+        Serials are the load-bearing part of the stamping. Each page gets a fresh monotone
+        `access_serial` in save order, and after the loop `pagetable.access_serial` is advanced past
+        every serial handed out. That is the exact analogue of the live tier-fetch path, which bumps
+        the table counter once per page in the allocation loop (pagetable.py:568, 605) and stamps the
+        page with that fresh serial (pagetable.py:589 -> 136-146), after which `add_ref` takes
+        `max(serial, page.access_serial)` (pagetable.py:132). Without the advance, the next job's
+        per-page serials would collide with or understate the restored pages, inverting LRU and
+        skewing defrag, because `build_eviction_order` sorts on `access_serial`
+        (pagetable.py:415, 430, 456-457, 910, 943-946).
+
+        Mutating the cache tensors requires inference mode: they are allocated under
+        `@torch.inference_mode` at load (model.py:489), so writing them from normal mode raises. The
+        stamping loop therefore enters `torch.inference_mode()` internally — callers may already be
+        inside it, and nesting is legal. The stash rebuild is deliberately done OUTSIDE that block, so
+        the tensors handed to `RecurrentCache.put()` are ordinary host tensors.
+        """
+        d = os.path.abspath(store)
+        with open(os.path.join(d, "meta.json")) as f:
+            meta = json.load(f)
+        kvstore.validate_store_dir(d, meta["files"])
+        for fn in ("pages.bin", "chain.json"):
+            if fn not in meta["files"]:
+                raise RuntimeError(f"store meta does not record a digest for {fn} — integrity root "
+                                   "incomplete")
+        for sm in meta["stashes"]:
+            if os.path.basename(sm["file"]) != sm["file"]:
+                raise RuntimeError(f"stash file name escapes the store dir: {sm['file']!r}")
+            if sm["file"] not in meta["files"]:
+                raise RuntimeError(f"stash file {sm['file']!r} has no recorded digest")
+
+        cache = self.cache
+        pins = meta["pins"]
+        for key, derive in self._store_pin_derivers().items():
+            if key == "cache_size":
+                # Wording kept from the oracle: a store made for a different pool can never be
+                # restored into this one, because the pages it names do not exist here.
+                if int(cache.max_num_tokens) != pins.get(key):
+                    raise RuntimeError("cache_size mismatch: store was made for a different pool "
+                                       f"(store cache_size={pins.get(key)}, "
+                                       f"this pool cache_size={int(cache.max_num_tokens)})")
+            else:
+                kvstore.expect_pin(key, derive(), pins.get(key))
+        extras = self._store_extra_pins()
+        for key, expected in extras.items():
+            if key in pins:
+                kvstore.expect_pin(key, expected, pins.get(key))
+        derivable = set(self._store_pin_derivers()) | set(extras)
+        for key in pins:
+            if key not in derivable:
+                raise RuntimeError(f"pin {key} is recorded in the store but not derivable on this "
+                                   "restore side — refusing to validate blind")
+
+        checks = meta.get("checks", {})
+        if not (checks.get("chain_complete") and checks.get("anchor_in_chain")):
+            raise RuntimeError(f"capture-time checks not both true: expected chain_complete=True "
+                               f"anchor_in_chain=True, actual={checks}")
+        if meta["stashes"] and self.recurrent_cache is None:
+            raise RuntimeError("store carries recurrent checkpoints but this generator has no "
+                               "recurrent cache to restore them into")
+
+        with open(os.path.join(d, "chain.json")) as f:
+            chain = json.load(f)
+        kvstore.expect_pin("chain.json page_size", pins.get("page_size"), chain.get("page_size"))
+
+        pt = self.pagetable
+        tensors = kvstore.paged_tensors(cache)
+        devices = kvstore.device_set(tensors)
+        with open(os.path.join(d, "pages.bin"), "rb") as f:
+            pages_raw = f.read()
+        # A store captured from a generator with no complete pages has an empty pages.bin, and
+        # torch.frombuffer refuses a zero-size buffer; the loop below does not run in that case, so an
+        # empty pinned tensor is the correct stand-in.
+        pages_pinned = torch.frombuffer(bytearray(pages_raw), dtype = torch.uint8).pin_memory() \
+            if pages_raw else torch.empty(0, dtype = torch.uint8).pin_memory()
+        del pages_raw
+
+        # Snapshot the free pool once, up front: we hand pages out of it in chain order and must not
+        # iterate a dict we are mutating.
+        pool = list(pt.unreferenced_pages.items())
+        used_idx = set()
+        serial = pt.access_serial
+        restored = 0
+
+        # Pre-mutation validation of every chain entry (fail-closed completeness): a tampered or
+        # re-stamped store must fail HERE — collision, descriptor count, slot shape/dtype, byte count
+        # and byte range — never half-stamped mid-loop. Intra-chain duplicates count as collisions.
+        if len(chain["entries"]) > len(pool):
+            raise RuntimeError(f"store has more pages ({len(chain['entries'])}) than this pool can "
+                               f"hold ({len(pool)})")
+        seen = set()
+        for e in chain["entries"]:
+            phash = bytes.fromhex(e["phash"])
+            if phash in seen or phash in pt.unreferenced_pages or phash in pt.referenced_pages:
+                raise RuntimeError("restored content hash collides with a page already in the pool")
+            seen.add(phash)
+            if e["prev_hash"] is not None:
+                try:
+                    prev = bytes.fromhex(e["prev_hash"])
+                except (TypeError, ValueError):
+                    raise RuntimeError("chain entry prev_hash is not valid hex")
+                if len(prev) != 16:
+                    raise RuntimeError("chain entry prev_hash is not a 16-byte hash")
+            tokens = e["tokens"]
+            if not isinstance(tokens, list) or len(tokens) != PAGE_SIZE or \
+                    not all(isinstance(t, int) and not isinstance(t, bool) for t in tokens):
+                raise RuntimeError(f"chain entry tokens must be a list of {PAGE_SIZE} ints")
+            descs = e["tensors"]
+            if len(descs) != len(tensors):
+                raise RuntimeError("chain entry tensor descriptor count does not match the live "
+                                   "cache")
+            for ct, desc in zip(tensors, descs):
+                off, nbytes, shape, dtype_str = desc[0], desc[1], desc[2], desc[3]
+                if list(ct[0].shape) != shape or \
+                        str(ct.dtype).replace("torch.", "") != dtype_str:
+                    raise RuntimeError("restored tensor slot does not match the live cache tensor")
+                if nbytes != int(ct[0].numel()) * int(ct.element_size()):
+                    raise RuntimeError("chain entry tensor byte count does not match the live "
+                                       "cache tensor")
+                if off < 0 or off + nbytes > pages_pinned.numel():
+                    raise RuntimeError("chain entry tensor bytes fall outside pages.bin")
+
+        try:
+            with torch.inference_mode():
+                for e in chain["entries"]:
+                    phash = bytes.fromhex(e["phash"])
+                    prev_hash = bytes.fromhex(e["prev_hash"]) if e["prev_hash"] is not None else None
+                    page = None
+                    old_phash = None
+                    for cand_phash, cand in pool:
+                        if cand.page_index not in used_idx and cand.ref_count == 0:
+                            page, old_phash = cand, cand_phash
+                            break
+                    assert page is not None, \
+                        "no unreferenced page left to restore into: the store is larger than this pool"
+                    used_idx.add(page.page_index)
+                    del pt.unreferenced_pages[old_phash]
+
+                    page.phash = phash;                   page.phash_revert = phash
+                    page.prev_hash = prev_hash;           page.prev_hash_revert = prev_hash
+                    serial += 1
+                    page.access_serial = serial;          page.access_serial_revert = serial
+                    page.kv_position = PAGE_SIZE;         page.kv_position_revert = PAGE_SIZE
+                    page.can_revert = False
+                    page.sequence.copy_(torch.tensor([e["tokens"]], dtype = torch.long))
+
+                    assert phash not in pt.unreferenced_pages and phash not in pt.referenced_pages, \
+                        "restored content hash collides with a page already in the pool"
+                    pt.unreferenced_pages[phash] = page
+
+                    for ct, desc in zip(tensors, e["tensors"]):
+                        off, nbytes, shape, dtype_str = desc[0], desc[1], desc[2], desc[3]
+                        assert list(ct[0].shape) == shape and \
+                               str(ct.dtype).replace("torch.", "") == dtype_str, \
+                               "restored tensor slot does not match the live cache tensor"
+                        cpu_view = pages_pinned[off:off + nbytes].view(getattr(torch, dtype_str)).view(shape)
+                        ct[page.page_index].copy_(cpu_view, non_blocking = True)
+                    restored += 1
+                pt.access_serial = serial
+            kvstore.sync_devices(devices)
+
+            rc = self.recurrent_cache
+            put = 0
+            if rc is not None:
+                for sm in meta["stashes"]:
+                    with open(os.path.join(d, sm["file"]), "rb") as f:
+                        raw = f.read()
+                    state = {"position": sm["position"], "checkpoint_size": sm["checkpoint_size"]}
+                    state.update(kvstore.stash_state_from_blob(raw, sm["tensors"]))
+                    rc.put(bytes.fromhex(sm["phash"]), kvstore.PreStashed(state))
+                    put += 1
+        except Exception:
+            # Mid-copy class (the validation class never mutates, so it never reaches here):
+            # return the pool to the fresh state so no half-stamped page can ever be matched and
+            # served (a page registered before all its tensors landed would serve wrong KV).
+            self._reset_pool_after_failed_restore()
+            raise
+
+        return {
+            "pages_restored": restored,
+            "stashes_restored": put,
+            "deepest_anchor_page_idx": meta["deepest_anchor_page_idx"],
+            "stash_keys": [bytes.fromhex(s["phash"]) for s in meta["stashes"]],
+            "meta": meta,
+        }
+
+    def _reset_pool_after_failed_restore(self):
+        """
+        Best-effort return to the fresh-pool state after a mid-restore (non-validation) failure.
+
+        restore_state runs on a fresh generator before anything is served, so resetting here cannot
+        disturb live work; it only guarantees that a half-stamped page is never matchable after the
+        failure (silent wrong-KV hazard). Each step is individually guarded: this must never mask the
+        original restore exception.
+        """
+        try:
+            self.pagetable.reset_page_table()
+        except Exception:
+            logger.error("kv restore cleanup: reset_page_table FAILED — the pool may hold "
+                         "partially restored pages and must not be trusted")
+            return
+        rc = self.recurrent_cache
+        if rc is not None:
+            try:
+                while rc:
+                    _k, popped = rc.popitem(last = False)
+                    if isinstance(popped, dict):
+                        from ..cache.recurrent import note_freed
+                        note_freed(int(popped.get("checkpoint_size", 0)))
+                rc.current_size = 0
+            except Exception:
+                logger.error("kv restore cleanup: recurrent-cache drain FAILED — leftover "
+                             "restore stashes may remain")
+        logger.warning("kv restore cleanup: pool reset to fresh state after failed restore "
+                       "(serving COLD)")
