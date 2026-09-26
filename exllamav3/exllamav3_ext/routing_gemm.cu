@@ -253,9 +253,6 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
 {
     if (hidden.dtype() != at::kHalf || gate_i8.dtype() != at::kChar || gate_sb.dtype() != at::kFloat || scores.dtype() != at::kHalf) return false;
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
-    // the int8 pipeline stages with cp.async (sm_80+); older devices decline
-    // to the fp16 router path
-    if (at::cuda::getDeviceProperties(hidden.get_device())->major < 8) return false;
     const int K = hidden.size(-1);
     // The deterministic int8 kernels need cp.async and mma.m16n8k32 s8 (both sm_80+) and
     // 97 KB of dynamic smem, over the pre-Ampere ceiling; cuBLAS serves the other arches
